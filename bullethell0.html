@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>Pocket Bullet Hell - Single Stream</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #05060b;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    background: #05060b;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+  var running = false;
+  var dead = false;
+  var level = 1;
+  var score = 0;
+  var best = Number(localStorage.getItem('pbh_best') || 0);
+  var t = 0;
+  var last = 0;
+  var fireTimer = 0;
+  var graze = 0;
+  var spawnTimer = 0;
+  var shake = 0;
+  var pointerDown = false;
+  var TOUCH_OFFSET = 72;
+
+  var player, bullets, shots, enemies, particles;
+  var MAX_BULLETS = 850;
+  var MAX_SHOTS = 260;
+
+  function reset() {
+    player = { x: W * 0.5, y: H * 0.78, r: 4, inv: 1.2 };
+    bullets = [];
+    shots = [];
+    enemies = [];
+    particles = [];
+    running = true;
+    dead = false;
+    level = 1;
+    score = 0;
+    graze = 0;
+    t = 0;
+    fireTimer = 0;
+    spawnTimer = 0;
+    shake = 0;
+  }
+
+  function resize() {
+    DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    W = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 320);
+    H = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 480);
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    if (!player) reset();
+    player.x = clamp(player.x, 16, W - 16);
+    player.y = clamp(player.y, 40, H - 16);
+    draw();
+  }
+
+  function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+  function dist2(a, b) { var dx = a.x - b.x, dy = a.y - b.y; return dx * dx + dy * dy; }
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+
+  function movePlayer(clientX, clientY, offsetY) {
+    var rect = canvas.getBoundingClientRect();
+    offsetY = offsetY || 0;
+    player.x = clamp(clientX - rect.left, 14, W - 14);
+    player.y = clamp(clientY - rect.top - offsetY, 32, H - 14);
+  }
+
+  function startAt(clientX, clientY, offsetY) {
+    if (!running || dead) reset();
+    pointerDown = true;
+    movePlayer(clientX, clientY, offsetY);
+  }
+
+  canvas.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    var p = e.changedTouches[0];
+    startAt(p.clientX, p.clientY, TOUCH_OFFSET);
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', function (e) {
+    e.preventDefault();
+    var p = e.changedTouches[0];
+    if (p && player) movePlayer(p.clientX, p.clientY, TOUCH_OFFSET);
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', function (e) {
+    e.preventDefault();
+    pointerDown = false;
+  }, { passive: false });
+
+  canvas.addEventListener('mousedown', function (e) { startAt(e.clientX, e.clientY, 0); });
+  window.addEventListener('mousemove', function (e) { if (pointerDown && player) movePlayer(e.clientX, e.clientY); });
+  window.addEventListener('mouseup', function () { pointerDown = false; });
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', function () { setTimeout(resize, 150); });
+
+  function spawnEnemy() {
+    var x = rnd(24, W - 24);
+    var y = -20;
+    var roll = Math.random();
+    var kind = roll < Math.min(0.22, level * 0.018) ? 2 : (roll < Math.min(0.72, 0.15 + level * 0.04) ? 1 : 0);
+    var hp = 2 + Math.floor(level / 3) + (kind === 2 ? 4 : kind);
+    enemies.push({ x: x, y: y, r: kind === 2 ? 18 : kind ? 15 : 12, hp: hp, max: hp, kind: kind, age: 0, cool: rnd(0.05, 0.55) });
+  }
+
+  function enemyShoot(e) {
+    var dx = player.x - e.x, dy = player.y - e.y;
+    var base = Math.atan2(dy, dx);
+
+    // Slow-storm pacing: bullets move slower, but enemies emit more of them
+    // and refresh patterns more often. This keeps pressure high while making
+    // the screen read more like a dense bullet-hell curtain.
+    var baseCount = e.kind === 2
+      ? 30
+      : (e.kind ? 16 + Math.min(10, Math.floor(level / 3)) : 8 + Math.min(12, Math.floor(level / 2)));
+    var n = Math.min(44, baseCount + Math.floor(level / 6));
+    var spread = e.kind ? Math.PI * 2 : 1.35;
+
+    for (var i = 0; i < n; i++) {
+      var wobble = Math.sin(t * 1.8 + e.age + i) * 0.16;
+      var a = e.kind
+        ? base + t * (e.kind === 2 ? 1.75 : 1.25) + i * Math.PI * 2 / n
+        : base + (i / Math.max(1, n - 1) - 0.5) * spread + wobble;
+      var speed = 74 + level * 6.4 + (e.kind ? 20 : 0) + (i % 4) * 5;
+      bullets.push({ x: e.x, y: e.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, r: e.kind === 2 ? 4.4 : 3.9, age: 0, grazed: false });
+    }
+
+    if (level >= 4 && !e.kind) {
+      for (var k = -2; k <= 2; k++) {
+        if (k === 0) continue;
+        var aa = base + k * 0.18;
+        var s = 105 + level * 5.6 + Math.abs(k) * 5;
+        bullets.push({ x: e.x, y: e.y, vx: Math.cos(aa) * s, vy: Math.sin(aa) * s, r: 3.2, age: 0, grazed: false });
+      }
+    }
+
+    // Emergency cap for older iPhones: drop the oldest bullets first, which
+    // preserves the current danger around the player.
+    if (bullets.length > MAX_BULLETS) bullets.splice(0, bullets.length - MAX_BULLETS);
+  }
+
+  function burst(x, y, n) {
+    for (var i = 0; i < n; i++) {
+      var a = rnd(0, Math.PI * 2), s = rnd(30, 180);
+      particles.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, age: 0, life: rnd(0.25, 0.75) });
+    }
+  }
+
+  function update(dt) {
+    if (!running || dead) return;
+    t += dt;
+    level = 1 + Math.floor(score / 300 + t / 24);
+    if (player.inv > 0) player.inv -= dt;
+
+    fireTimer -= dt;
+    if (fireTimer <= 0) {
+      // Single-lane vertical stream. Same projectile speed: 500 px/s.
+      // High fire rate keeps the weapon punchy without the overpowering spread.
+      fireTimer = Math.max(0.026, 0.046 - level * 0.00028);
+      shots.push({
+        x: player.x,
+        y: player.y - 18,
+        vx: 0,
+        vy: -500,
+        r: 3.1,
+        dmg: 1,
+        age: 0
+      });
+      if (shots.length > MAX_SHOTS) shots.splice(0, shots.length - MAX_SHOTS);
+    }
+
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnTimer = Math.max(0.12, 0.62 - level * 0.026);
+      spawnEnemy();
+    }
+
+    var i, j, s, e, b;
+    for (i = shots.length - 1; i >= 0; i--) {
+      s = shots[i];
+      s.age = (s.age || 0) + dt;
+      s.x += s.vx * dt; s.y += s.vy * dt;
+      if (s.y < -24 || s.x < -24 || s.x > W + 24) shots.splice(i, 1);
+    }
+
+    for (i = enemies.length - 1; i >= 0; i--) {
+      e = enemies[i];
+      e.age += dt;
+      e.y += (55 + level * 4.5 + e.kind * 10) * dt;
+      e.x += Math.sin(e.age * (2.8 + e.kind) + e.y * 0.014) * (e.kind ? 75 : 42) * dt;
+      e.cool -= dt;
+      // Only visible enemies are allowed to shoot. Once an enemy has crossed
+      // below the screen, it can drift out and despawn, but it no longer adds
+      // surprise bullets from off-screen.
+      if (e.cool <= 0) {
+        e.cool = Math.max(0.11, 0.52 - level * 0.015) + rnd(0, 0.11);
+        if (e.y >= 0 && e.y <= H) enemyShoot(e);
+      }
+      if (e.y > H + 40) enemies.splice(i, 1);
+    }
+
+    for (i = bullets.length - 1; i >= 0; i--) {
+      b = bullets[i];
+      b.age += dt;
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      if (b.x < -30 || b.x > W + 30 || b.y < -40 || b.y > H + 40) bullets.splice(i, 1);
+      else {
+        var d = dist2(b, player);
+        if (!b.grazed && d < 32 * 32) { b.grazed = true; graze++; score += 2; }
+        if (player.inv <= 0 && d < (b.r + player.r) * (b.r + player.r)) die();
+      }
+    }
+
+    for (i = enemies.length - 1; i >= 0; i--) {
+      e = enemies[i];
+      if (player.inv <= 0 && dist2(e, player) < (e.r + player.r) * (e.r + player.r)) die();
+      for (j = shots.length - 1; j >= 0; j--) {
+        s = shots[j];
+        if (dist2(e, s) < (e.r + s.r) * (e.r + s.r)) {
+          shots.splice(j, 1);
+          e.hp -= s.dmg || 1;
+          score += 10 * (s.dmg || 1);
+          burst(s.x, s.y, 2);
+          if (e.hp <= 0) {
+            score += 80 + level * 5;
+            burst(e.x, e.y, 18);
+            enemies.splice(i, 1);
+            break;
+          }
+        }
+      }
+    }
+
+    for (i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.age += dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= Math.pow(0.03, dt); p.vy *= Math.pow(0.03, dt);
+      if (p.age >= p.life) particles.splice(i, 1);
+    }
+    if (shake > 0) shake -= dt;
+  }
+
+  function die() {
+    if (dead) return;
+    dead = true;
+    running = false;
+    shake = 0.5;
+    burst(player.x, player.y, 42);
+    best = Math.max(best, score);
+    localStorage.setItem('pbh_best', String(best));
+  }
+
+  function circle(x, y, r) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function text(str, x, y, size, align) {
+    ctx.font = '700 ' + size + 'px -apple-system, BlinkMacSystemFont, system-ui, sans-serif';
+    ctx.textAlign = align || 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(str, x, y);
+  }
+
+  function draw() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    var ox = 0, oy = 0;
+    if (shake > 0) { ox = rnd(-4, 4) * shake * 4; oy = rnd(-4, 4) * shake * 4; }
+    ctx.save();
+    ctx.translate(ox, oy);
+
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#060713');
+    g.addColorStop(1, '#0b1020');
+    ctx.fillStyle = g;
+    ctx.fillRect(-10, -10, W + 20, H + 20);
+
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = '#ffffff';
+    for (var i = 0; i < 70; i++) {
+      var sx = (i * 97 + Math.floor(t * 18)) % W;
+      var sy = (i * 53 + t * (18 + i % 7)) % H;
+      circle(sx, sy, (i % 3) + 0.6);
+    }
+    ctx.globalAlpha = 1;
+
+    for (i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      ctx.globalAlpha = Math.max(0, 1 - p.age / p.life);
+      ctx.fillStyle = '#dff7ff';
+      circle(p.x, p.y, 2.2);
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (i = 0; i < shots.length; i++) {
+      var s = shots[i];
+      var len = 24;
+      var a = Math.atan2(s.vy, s.vx);
+      ctx.save();
+      ctx.translate(s.x, s.y);
+      ctx.rotate(a + Math.PI / 2);
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = '#8dfcff';
+      ctx.fillRect(-s.r * 1.7, -len * 0.7, s.r * 3.4, len);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#66f7ff';
+      ctx.fillRect(-s.r * 0.75, -len, s.r * 1.5, len);
+      ctx.restore();
+    }
+    ctx.restore();
+
+    for (i = 0; i < enemies.length; i++) {
+      var e = enemies[i];
+      ctx.fillStyle = e.kind ? '#ff54bf' : '#ff7a54';
+      circle(e.x, e.y, e.r);
+      ctx.fillStyle = '#240015';
+      circle(e.x, e.y, Math.max(2, e.r * (e.hp / e.max) * 0.55));
+    }
+
+    ctx.fillStyle = '#ffe66b';
+    for (i = 0; i < bullets.length; i++) {
+      var b = bullets[i];
+      circle(b.x, b.y, b.r);
+    }
+
+    if (!dead) {
+      ctx.save();
+      ctx.translate(player.x, player.y);
+      if (player.inv > 0 && Math.floor(t * 18) % 2 === 0) ctx.globalAlpha = 0.35;
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.42 + 0.18 * Math.sin(t * 45);
+      ctx.fillStyle = '#66f7ff';
+      ctx.beginPath();
+      ctx.moveTo(0, -34);
+      ctx.lineTo(7, -12);
+      ctx.lineTo(-7, -12);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = '#8cff7a';
+      ctx.beginPath();
+      ctx.moveTo(0, -13);
+      ctx.lineTo(10, 12);
+      ctx.lineTo(0, 7);
+      ctx.lineTo(-10, 12);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#caffff';
+      ctx.fillRect(-2, -21, 4, 10);
+      ctx.fillStyle = '#ffffff';
+      circle(0, 0, player.r);
+      ctx.restore();
+    }
+
+    ctx.restore();
+
+    ctx.fillStyle = '#eaf6ff';
+    ctx.font = '700 15px -apple-system, BlinkMacSystemFont, system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('SCORE ' + score + '  GRAZE ' + graze, 12, 12);
+    ctx.textAlign = 'right';
+    ctx.fillText('LV ' + level + '  BEST ' + best, W - 12, 12);
+
+    if (!running && !dead) {
+      ctx.fillStyle = '#eaf6ff';
+      text('POCKET BULLET HELL', W / 2, H * 0.38, 25, 'center');
+      ctx.fillStyle = '#9fb3c8';
+      text('tap and drag to start', W / 2, H * 0.45, 16, 'center');
+      text('ship floats above your finger', W / 2, H * 0.50, 14, 'center');
+      text('power gun mode • slower storm, stronger ship', W / 2, H * 0.55, 14, 'center');
+    }
+
+    if (dead) {
+      ctx.fillStyle = 'rgba(5,6,11,0.62)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#ffffff';
+      text('DESTROYED', W / 2, H * 0.42, 28, 'center');
+      ctx.fillStyle = '#9fb3c8';
+      text('score ' + score + '  •  best ' + best, W / 2, H * 0.49, 16, 'center');
+      text('tap to restart', W / 2, H * 0.56, 16, 'center');
+    }
+  }
+
+  function loop(now) {
+    if (!last) last = now;
+    var dt = Math.min(0.033, (now - last) / 1000 || 0);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  try {
+    resize();
+    running = false;
+    dead = false;
+    requestAnimationFrame(loop);
+  } catch (err) {
+    document.body.innerHTML = '<pre style="color:white;background:#05060b;padding:16px;white-space:pre-wrap">Game failed to start:\n' + String(err && err.stack || err) + '</pre>';
+  }
+}());
+</script>
+</body>
+</html>

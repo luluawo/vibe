@@ -1,0 +1,1413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no,maximum-scale=1">
+<title>Gravhell Explorer</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #06070b;
+    color: #e8ecff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    background: #06070b;
+  }
+  #hud {
+    position: fixed;
+    left: max(12px, env(safe-area-inset-left));
+    top: max(10px, env(safe-area-inset-top));
+    font-size: 13px;
+    letter-spacing: .08em;
+    opacity: .9;
+    pointer-events: none;
+    text-shadow: 0 1px 4px #000;
+  }
+  #hint {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    text-align: center;
+    padding: 28px;
+    background: radial-gradient(circle, rgba(20,24,40,.72), rgba(6,7,11,.95));
+    cursor: pointer;
+  }
+  #hint.hidden { display: none; }
+  .box {
+    max-width: 460px;
+    border: 1px solid rgba(220,230,255,.25);
+    border-radius: 20px;
+    padding: 24px 20px;
+    background: rgba(255,255,255,.035);
+    box-shadow: 0 20px 80px rgba(0,0,0,.45);
+  }
+  h1 { margin: 0 0 10px; font-size: 25px; font-weight: 700; letter-spacing: .11em; }
+  p { margin: 9px 0; opacity: .88; font-size: 14px; }
+  .small { opacity: .65; font-size: 12px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud"></div>
+<div id="hint">
+  <div class="box">
+    <h1>GRAVHELL EXPLORER</h1>
+    <p>Drag anywhere to pilot the triangle. It fires from its nose.</p>
+    <p>Explore a procedural gravity field. Fight stations, fighters, and destructible planets.</p>
+    <p>Every body emits and receives gravity.</p>
+    <p class="small">Tap to start / restart</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const hud = document.getElementById("hud");
+  const hint = document.getElementById("hint");
+
+  let W = 0, H = 0, DPR = 1;
+  const TAU = Math.PI * 2;
+  const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const hash32 = (x) => {
+    x |= 0;
+    x = Math.imul(x ^ (x >>> 16), 0x7feb352d);
+    x = Math.imul(x ^ (x >>> 15), 0x846ca68b);
+    return (x ^ (x >>> 16)) >>> 0;
+  };
+  const hash2 = (x, y, salt = 0) => hash32(x * 374761393 ^ y * 668265263 ^ salt * 1442695041);
+  const rng2 = (x, y, salt = 0) => hash2(x, y, salt) / 4294967296;
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = Math.floor(innerWidth);
+    H = Math.floor(innerHeight);
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  addEventListener("resize", resize, { passive: true });
+  resize();
+
+  const CFG = {
+    chunk: 620,
+    loadRadius: 2,
+    unloadDistance: 2200,
+    gravityRange: 1250,
+    G: 520,
+    softening: 650,
+    gravityCap: 1550,
+    globalDrag: 0.992,
+    playerDrag: 0.875,
+    thrust: 2050,
+    fingerOffset: 72,
+    maxPlayerSpeed: 430,
+    bulletSpeed: 205,
+    enemyBulletSpeed: 155,
+    enemyShootEvery: 1.05,
+    enemyChaseAccel: 185,
+    enemyPreferredRange: 360,
+    enemyMaxSpeed: 245,
+    miniSpawnEvery: 4.2,
+    miniMaxPerStation: 4,
+    miniChaseAccel: 420,
+    miniMaxSpeed: 360,
+    miniShootEvery: 1.15,
+    playerShootEvery: 0.082,
+    maxActiveEnemies: 28,
+    maxActiveBullets: 310,
+    maxBodies: 390,
+    minPlayerBullets: 95,
+    maxEnemyBullets: 150,
+    lightRange: 260,
+    lightSoftness: 0.18,
+    maxLightSources: 90,
+  };
+
+  let running = false;
+  let dead = false;
+  let time = 0;
+  let score = 0;
+  let discovered = 0;
+  let shake = 0;
+  let playerFire = 0;
+
+  let bodies = [];
+  let player = null;
+  let loadedChunks = new Map();
+  let visitedChunks = new Set();
+  let camera = { x: 0, y: 0, scale: 1 };
+  let pointer = { active: false, x: 0, y: 0 };
+
+  function makeBody(type, x, y, r, mass) {
+    return {
+      type, x, y, vx: 0, vy: 0, ax: 0, ay: 0, r,
+      mass,                 // gravitational mass: how strongly it emits gravity
+      inertia: mass,         // inertial mass: how strongly it resists gravity
+      gravityScale: 1,       // receiver multiplier: how strongly it feels gravity
+      hp: 1, age: 0, shoot: rand(.3, 1.0), phase: rand(0, TAU),
+      dead: false, friendly: false, hostile: false, permanent: false,
+      chunk: "",
+    };
+  }
+
+  function reset() {
+    running = true;
+    dead = false;
+    time = 0;
+    score = 0;
+    discovered = 0;
+    shake = 0;
+    playerFire = 0;
+    pointer.active = false;
+
+    bodies = [];
+    loadedChunks = new Map();
+    visitedChunks = new Set();
+
+    player = makeBody("player", 0, 0, 10, 12);
+    player.hp = 5;
+    player.maxHp = player.hp;
+    player.friendly = true;
+    player.permanent = true;
+    player.aim = -Math.PI / 2;
+    bodies.push(player);
+
+    camera.x = player.x;
+    camera.y = player.y;
+    loadWorldAroundPlayer(true);
+
+    hint.classList.add("hidden");
+  }
+
+  function gameOver() {
+    dead = true;
+    running = false;
+    hint.querySelector("h1").textContent = "SIGNAL LOST";
+    hint.querySelector(".small").textContent = "Tap to restart";
+    hint.classList.remove("hidden");
+  }
+
+  function chunkKey(cx, cy) { return cx + "," + cy; }
+  function playerChunk() {
+    return {
+      x: Math.floor(player.x / CFG.chunk),
+      y: Math.floor(player.y / CFG.chunk),
+    };
+  }
+
+  function addChunkBody(body, key) {
+    body.chunk = key;
+    bodies.push(body);
+  }
+
+  function generateChunk(cx, cy) {
+    const key = chunkKey(cx, cy);
+    if (loadedChunks.has(key)) return;
+    loadedChunks.set(key, true);
+    if (!visitedChunks.has(key)) {
+      visitedChunks.add(key);
+      discovered++;
+    }
+
+    // Keep spawn clean.
+    const originD = Math.hypot((cx + .5) * CFG.chunk, (cy + .5) * CFG.chunk);
+    const safe = originD < 520;
+
+    const baseX = cx * CFG.chunk;
+    const baseY = cy * CFG.chunk;
+
+    const planetCount = safe ? 2 : 2 + Math.floor(rng2(cx, cy, 1) * 4);
+    for (let i = 0; i < planetCount; i++) {
+      const x = baseX + 120 + rng2(cx, cy, 10 + i) * (CFG.chunk - 240);
+      const y = baseY + 120 + rng2(cx, cy, 20 + i) * (CFG.chunk - 240);
+      const r = 16 + rng2(cx, cy, 30 + i) * 36;
+      const p = makeBody("planet", x, y, r, planetMassFromRadius(r));
+      p.hp = Math.ceil(r * r * 1.8);      // much more durable than before
+      p.maxHp = p.hp;
+      p.vx = (rng2(cx, cy, 40 + i) - .5) * 14;
+      p.vy = (rng2(cx, cy, 50 + i) - .5) * 14;
+      addChunkBody(p, key);
+    }
+
+    const asteroidCount = 5 + Math.floor(rng2(cx, cy, 2) * 7);
+    for (let i = 0; i < asteroidCount; i++) {
+      const x = baseX + rng2(cx, cy, 100 + i) * CFG.chunk;
+      const y = baseY + rng2(cx, cy, 120 + i) * CFG.chunk;
+      const r = 6 + rng2(cx, cy, 140 + i) * 12;
+      const a = makeBody("asteroid", x, y, r, r * r * .018);
+      a.hp = 1;
+      a.vx = (rng2(cx, cy, 160 + i) - .5) * 40;
+      a.vy = (rng2(cx, cy, 180 + i) - .5) * 40;
+      addChunkBody(a, key);
+    }
+
+    if (!safe && rng2(cx, cy, 3) > .35) {
+      const e = makeBody("enemy",
+        baseX + 100 + rng2(cx, cy, 200) * (CFG.chunk - 200),
+        baseY + 100 + rng2(cx, cy, 201) * (CFG.chunk - 200),
+        13, 10
+      );
+      e.vx = (rng2(cx, cy, 202) - .5) * 55;
+      e.vy = (rng2(cx, cy, 203) - .5) * 55;
+      e.hp = 10 + Math.floor(Math.hypot(cx, cy) * .55);
+      e.maxHp = e.hp;
+      e.hostile = true;
+      addChunkBody(e, key);
+    }
+
+    if (!safe && rng2(cx, cy, 4) > .72) {
+      const s = makeBody("station",
+        baseX + 140 + rng2(cx, cy, 300) * (CFG.chunk - 280),
+        baseY + 140 + rng2(cx, cy, 301) * (CFG.chunk - 280),
+        28, 42
+      );
+      s.hp = 28 + Math.floor(Math.hypot(cx, cy) * .85);
+      s.maxHp = s.hp;
+      s.hostile = true;
+      s.spawn = rand(0.8, CFG.miniSpawnEvery);
+      addChunkBody(s, key);
+    }
+  }
+
+  function loadWorldAroundPlayer(initial = false) {
+    const c = playerChunk();
+    const r = CFG.loadRadius;
+
+    for (let y = c.y - r; y <= c.y + r; y++) {
+      for (let x = c.x - r; x <= c.x + r; x++) {
+        generateChunk(x, y);
+      }
+    }
+
+    const keep = new Set();
+    for (let y = c.y - r; y <= c.y + r; y++) {
+      for (let x = c.x - r; x <= c.x + r; x++) keep.add(chunkKey(x, y));
+    }
+
+    for (const key of [...loadedChunks.keys()]) {
+      if (!keep.has(key)) loadedChunks.delete(key);
+    }
+  }
+
+  function worldFromScreen(x, y) {
+    return {
+      x: camera.x + (x - W / 2) / camera.scale,
+      y: camera.y + (y - H / 2) / camera.scale,
+    };
+  }
+  function screenFromWorld(x, y) {
+    return {
+      x: (x - camera.x) * camera.scale + W / 2,
+      y: (y - camera.y) * camera.scale + H / 2,
+    };
+  }
+
+  function countBodies() {
+    const c = {
+      total: bodies.length,
+      pbullet: 0,
+      ebullet: 0,
+      bullet: 0,
+      mini: 0,
+    };
+    for (const b of bodies) {
+      if (b.dead) continue;
+      if (b.type === "pbullet") { c.pbullet++; c.bullet++; }
+      else if (b.type === "ebullet") { c.ebullet++; c.bullet++; }
+      else if (b.type === "mini") c.mini++;
+    }
+    return c;
+  }
+
+  function bodyPriority(b, mode) {
+    if (b === player) return -1e9;
+
+    const dx = b.x - player.x;
+    const dy = b.y - player.y;
+    const d = Math.hypot(dx, dy);
+    const far = d / Math.max(1, CFG.unloadDistance);
+
+    // Higher score means more disposable.
+    switch (b.type) {
+      case "chunk":
+        return 950 + far * 300 + b.age * 8;
+      case "asteroid":
+        return 760 + far * 260 + b.age * 3;
+      case "ebullet":
+        return 680 + far * 360 + b.age * 32;
+      case "pbullet":
+        // Protect player bullets, especially fresh/near ones.
+        return mode === "player-shot"
+          ? 95 + far * 140 + b.age * 3
+          : 210 + far * 180 + b.age * 6;
+      case "mini":
+        return 520 + far * 300 + b.age * 1.2;
+      case "enemy":
+        return 360 + far * 260 + b.age * 0.5;
+      case "station":
+        return 250 + far * 220;
+      case "planet":
+        return 120 + far * 100;
+      default:
+        return 500 + far * 200 + b.age;
+    }
+  }
+
+  function removeMostDisposable(mode, predicate = () => true) {
+    let best = -1;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < bodies.length; i++) {
+      const b = bodies[i];
+      if (b === player || b.dead || !predicate(b)) continue;
+      const s = bodyPriority(b, mode);
+      if (s > bestScore) {
+        bestScore = s;
+        best = i;
+      }
+    }
+
+    if (best >= 0) {
+      bodies.splice(best, 1);
+      return true;
+    }
+    return false;
+  }
+
+  function enforceBodyBudget(mode = "normal") {
+    if (!player || bodies.length <= CFG.maxBodies * 1.08) return;
+
+    const counts = countBodies();
+
+    // Build one disposable list, sort once, then remove from most disposable downward.
+    // This avoids many repeated full-array scans while bullets are spawning.
+    const disposable = [];
+    for (let i = 0; i < bodies.length; i++) {
+      const b = bodies[i];
+      if (b === player || b.dead) continue;
+
+      // In player-shot mode, strongly preserve player bullets.
+      if (mode === "player-shot" && b.type === "pbullet" && counts.pbullet < CFG.minPlayerBullets) {
+        continue;
+      }
+
+      disposable.push([bodyPriority(b, mode), i, b]);
+    }
+
+    disposable.sort((a, b) => b[0] - a[0]);
+
+    let target = CFG.maxBodies;
+    let ebullets = counts.ebullet;
+    const remove = new Set();
+
+    for (const [, i, b] of disposable) {
+      if (bodies.length - remove.size <= target && ebullets <= CFG.maxEnemyBullets) break;
+
+      // Prefer removing enemy bullets when enemy bullet cap is exceeded.
+      if (ebullets > CFG.maxEnemyBullets) {
+        if (b.type !== "ebullet") continue;
+        ebullets--;
+        remove.add(i);
+        continue;
+      }
+
+      // Normal overflow removal. Avoid player bullets unless absolutely necessary.
+      if (b.type === "pbullet" && bodies.length - remove.size <= CFG.maxBodies + 20) continue;
+      remove.add(i);
+    }
+
+    if (remove.size) {
+      bodies = bodies.filter((_, i) => !remove.has(i));
+    }
+  }
+
+  function spawnBullet(owner, angle, speed, friendly) {
+    // Player shooting has priority over the simulation budget.
+    // Before refusing a shot, remove low-priority bodies first.
+    if (friendly) {
+      if (bodies.length > CFG.maxBodies) enforceBodyBudget("player-shot");
+    } else {
+      const counts = countBodies();
+      if (counts.ebullet >= CFG.maxEnemyBullets) return;
+      if (counts.total >= CFG.maxBodies) enforceBodyBudget("enemy-shot");
+    }
+
+    const b = makeBody(friendly ? "pbullet" : "ebullet",
+      owner.x + Math.cos(angle) * (owner.r + 8),
+      owner.y + Math.sin(angle) * (owner.r + 8),
+      friendly ? 3.0 : 4.1,
+      friendly ? 2.8 : 3.2
+    );
+
+    // Bullets still emit real gravity, but they are very easy to move.
+    // This makes streams curve, orbit, collapse, and form temporary masses.
+    b.inertia = friendly ? 0.24 : 0.28;
+    b.gravityScale = friendly ? 6.5 : 7.5;
+
+    b.vx = owner.vx * 0.22 + Math.cos(angle) * speed;
+    b.vy = owner.vy * 0.22 + Math.sin(angle) * speed;
+    b.hp = 1;
+    b.friendly = friendly;
+    b.hostile = !friendly;
+    b.permanent = true;
+    bodies.push(b);
+
+    if (bodies.length > CFG.maxBodies * 1.06) enforceBodyBudget(friendly ? "player-shot" : "enemy-shot");
+  }
+
+  function planetMassFromRadius(r) {
+    return r * r * 0.045;
+  }
+
+  function spawnPlanetChunk(planet, bullet) {
+    const angle = Math.atan2(bullet.y - planet.y, bullet.x - planet.x);
+    const size = clamp(planet.r * rand(0.11, 0.18), 4.5, 10.5);
+
+    const c = makeBody(
+      "chunk",
+      planet.x + Math.cos(angle) * (planet.r + size + 1),
+      planet.y + Math.sin(angle) * (planet.r + size + 1),
+      size,
+      planetMassFromRadius(size) * 0.82
+    );
+
+    c.hp = 1;
+    c.chunk = planet.chunk;
+    c.vx =
+      planet.vx * 0.55 +
+      bullet.vx * 0.28 +
+      Math.cos(angle) * rand(45, 105) +
+      rand(-18, 18);
+    c.vy =
+      planet.vy * 0.55 +
+      bullet.vy * 0.28 +
+      Math.sin(angle) * rand(45, 105) +
+      rand(-18, 18);
+
+    // Chunks are real gravity bodies too, but a little more responsive
+    // than full planets so debris fields keep moving.
+    c.inertia = Math.max(0.7, c.mass * 0.75);
+    c.gravityScale = 1.25;
+
+    bodies.push(c);
+    if (bodies.length > CFG.maxBodies) enforceBodyBudget("debris");
+  }
+
+  function chipPlanet(planet, bullet) {
+    bullet.dead = true;
+
+    const oldR = planet.r;
+    const damage = bullet.type === "pbullet" ? 9 : 5;
+    planet.hp -= damage;
+
+    // Only emit visible chunks at damage thresholds, not every bullet.
+    // This makes planets feel like durable mineable bodies instead of balloons.
+    const hpRatio = planet.hp / Math.max(1, planet.maxHp ?? planet.hp);
+    const targetR = Math.max(7, Math.sqrt(Math.max(planet.hp, 0) / 1.8));
+    const shouldChip =
+      targetR < planet.r - 1.7 ||
+      planet.hp <= 0 ||
+      Math.random() < 0.10;
+
+    if (shouldChip) {
+      const chip = clamp(planet.r - targetR, 0.6, oldR * 0.08);
+      const crowded = bodies.length > CFG.maxBodies * 0.86;
+      const chunks = crowded ? 1 : (oldR > 26 && Math.random() < 0.45 ? 2 : 1);
+      for (let i = 0; i < chunks; i++) spawnPlanetChunk(planet, bullet);
+
+      planet.r = Math.max(targetR, planet.r - chip);
+      planet.mass = planetMassFromRadius(planet.r);
+      planet.inertia = planet.mass;
+      score += 1 + Math.floor(chip * 0.5);
+    } else {
+      score += 1;
+    }
+
+    // Transfer a tiny amount of impact momentum so repeated fire can slowly perturb planets.
+    planet.vx += bullet.vx * 0.0018;
+    planet.vy += bullet.vy * 0.0018;
+
+    if (planet.hp <= 0 || planet.r < 7.5) {
+      // Final breakup: turn the remaining core into a debris burst.
+      const burst = bodies.length > CFG.maxBodies * 0.86 ? 3 : 8;
+      for (let i = 0; i < burst; i++) spawnPlanetChunk(planet, bullet);
+      planet.dead = true;
+      score += 80;
+    }
+  }
+
+  function controls(dt) {
+    if (!pointer.active || !player || player.dead) return;
+
+    const targetScreen = { x: pointer.x, y: pointer.y - CFG.fingerOffset };
+    const target = worldFromScreen(targetScreen.x, targetScreen.y);
+    const dx = target.x - player.x;
+    const dy = target.y - player.y;
+    const d = Math.hypot(dx, dy) || 1;
+
+    if (d > 8) player.aim = Math.atan2(dy, dx);
+
+    const pull = clamp(d / 120, 0, 1);
+    player.vx += (dx / d) * CFG.thrust * pull * dt;
+    player.vy += (dy / d) * CFG.thrust * pull * dt;
+    player.vx *= Math.pow(CFG.playerDrag, dt * 60);
+    player.vy *= Math.pow(CFG.playerDrag, dt * 60);
+
+    const s = Math.hypot(player.vx, player.vy);
+    if (s > CFG.maxPlayerSpeed) {
+      player.vx = player.vx / s * CFG.maxPlayerSpeed;
+      player.vy = player.vy / s * CFG.maxPlayerSpeed;
+    }
+  }
+
+  function applyGravity(dt) {
+    for (const b of bodies) b.ax = b.ay = 0;
+
+    // True all-body gravity:
+    // every active entity both emits gravity and receives gravity, including bullets.
+    // The range/falloff/softening are only gameplay and performance constraints.
+    const range = CFG.gravityRange;
+    const range2 = range * range;
+
+    for (let i = 0; i < bodies.length; i++) {
+      const a = bodies[i];
+      if (a.dead || a.mass <= 0) continue;
+
+      for (let j = i + 1; j < bodies.length; j++) {
+        const b = bodies[j];
+        if (b.dead || b.mass <= 0) continue;
+
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        const raw2 = dx * dx + dy * dy;
+        if (raw2 > range2) continue;
+
+        // Softened inverse-square gravity. This makes bullet clouds attract
+        // into loose moving masses instead of numerically snapping together.
+        const soft2 = raw2 + CFG.softening;
+        const d = Math.sqrt(soft2);
+        dx /= d;
+        dy /= d;
+
+        // Smoothly fade gravity at the simulation boundary so unloaded
+        // objects don't create sudden force discontinuities.
+        const q = 1 - raw2 / range2;
+        const falloff = q * q;
+
+        const base = Math.min(CFG.gravityCap, CFG.G * falloff / soft2);
+
+        // Acceleration on each body is proportional to the other body's mass.
+        // This keeps Newton-style symmetry: bullets pull planets slightly,
+        // and planets pull bullets strongly.
+        const aa = base * b.mass * (a.gravityScale ?? 1) / Math.max(0.001, a.inertia ?? a.mass);
+        const ab = base * a.mass * (b.gravityScale ?? 1) / Math.max(0.001, b.inertia ?? b.mass);
+
+        a.ax += dx * aa;
+        a.ay += dy * aa;
+        b.ax -= dx * ab;
+        b.ay -= dy * ab;
+      }
+    }
+
+    for (const b of bodies) {
+      if (b.dead) continue;
+
+      b.vx += b.ax * dt;
+      b.vy += b.ay * dt;
+
+      // Friction keeps the all-body N-body simulation playable.
+      b.vx *= Math.pow(CFG.globalDrag, dt * 60);
+      b.vy *= Math.pow(CFG.globalDrag, dt * 60);
+
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.age += dt;
+    }
+  }
+
+  function collide() {
+    for (let i = 0; i < bodies.length; i++) {
+      const a = bodies[i];
+      if (a.dead) continue;
+      for (let j = i + 1; j < bodies.length; j++) {
+        const b = bodies[j];
+        if (b.dead) continue;
+
+        const rr = a.r + b.r;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= rr * rr) continue;
+
+        const d = Math.sqrt(d2) || 0.001;
+        const nx = dx / d, ny = dy / d;
+        const overlap = rr - d;
+
+        const fixedA = a.type === "planet" || a.type === "station";
+        const fixedB = b.type === "planet" || b.type === "station";
+        const invA = fixedA ? 0 : 1 / a.mass;
+        const invB = fixedB ? 0 : 1 / b.mass;
+        const inv = invA + invB || 1;
+
+        a.x -= nx * overlap * invA / inv;
+        a.y -= ny * overlap * invA / inv;
+        b.x += nx * overlap * invB / inv;
+        b.y += ny * overlap * invB / inv;
+
+        const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
+        const rel = rvx * nx + rvy * ny;
+        if (rel < 0) {
+          const impulse = -(1.04) * rel / inv;
+          a.vx -= impulse * nx * invA;
+          a.vy -= impulse * ny * invA;
+          b.vx += impulse * nx * invB;
+          b.vy += impulse * ny * invB;
+        }
+
+        damage(a, b);
+      }
+    }
+  }
+
+  function damage(a, b) {
+    const hit = (x, y) => {
+      if (x.type === "pbullet" && (y.type === "enemy" || y.type === "station" || y.type === "mini")) {
+        x.dead = true;
+        y.armorHit = (y.armorHit ?? 0) + 1;
+        const threshold = y.type === "station" ? 3 : y.type === "enemy" ? 2 : 1;
+        if (y.armorHit >= threshold) {
+          y.hp--;
+          y.armorHit = 0;
+        }
+        score += y.type === "station" ? 6 : y.type === "enemy" ? 8 : 5;
+      }
+      if (x.type === "pbullet" && y.type === "asteroid") {
+        x.dead = true; y.dead = true; score += 2;
+      }
+      if ((x.type === "pbullet" || x.type === "ebullet") && y.type === "planet") {
+        chipPlanet(y, x);
+      }
+      if ((x.type === "pbullet" || x.type === "ebullet") && y.type === "chunk") {
+        x.dead = true;
+        y.hp--;
+        y.vx += x.vx * 0.04;
+        y.vy += x.vy * 0.04;
+        score += 1;
+      }
+      if (x.type === "ebullet" && y.type === "player") {
+        x.dead = true; y.hp--; shake = 7;
+      }
+      if ((x.type === "enemy" || x.type === "station" || x.type === "mini" || x.type === "asteroid" || x.type === "chunk") && y.type === "player") {
+        x.hp -= x.type === "asteroid" || x.type === "chunk" ? 1 : x.type === "mini" ? 2 : 2;
+        y.hp--; shake = x.type === "mini" ? 8 : 10;
+      }
+      if ((x.type === "planet" || x.type === "station") && y.type === "player") {
+        y.hp--; shake = 12;
+      }
+    };
+    hit(a, b); hit(b, a);
+
+    if (a.hp <= 0) a.dead = true;
+    if (b.hp <= 0) b.dead = true;
+  }
+
+  function nearbyMiniCount(station) {
+    let n = 0;
+    for (const b of bodies) {
+      if (b.type !== "mini" || b.dead || b.mother !== station) continue;
+      n++;
+    }
+    return n;
+  }
+
+  function spawnMiniFighter(station) {
+    if (!player || player.dead) return;
+    if (bodies.length > CFG.maxBodies * 0.98) enforceBodyBudget("mini-spawn");
+    if (bodies.length > CFG.maxBodies) return;
+    if (nearbyMiniCount(station) >= CFG.miniMaxPerStation) return;
+
+    const a = Math.atan2(player.y - station.y, player.x - station.x) + rand(-0.55, 0.55);
+    const m = makeBody(
+      "mini",
+      station.x + Math.cos(a) * (station.r + 18),
+      station.y + Math.sin(a) * (station.r + 18),
+      7.2,
+      6.5
+    );
+
+    m.hp = 4 + Math.floor(Math.hypot(station.x, station.y) / 2600);
+    m.maxHp = m.hp;
+    m.hostile = true;
+    m.mother = station;
+    m.aim = a;
+    m.shoot = rand(0.25, CFG.miniShootEvery);
+    m.vx = station.vx + Math.cos(a) * rand(80, 140);
+    m.vy = station.vy + Math.sin(a) * rand(80, 140);
+    m.inertia = 3.8;
+    m.gravityScale = 1.25;
+    m.permanent = true;
+    bodies.push(m);
+  }
+
+  function stationSpawning(dt) {
+    if (!player || player.dead) return;
+
+    for (const s of bodies) {
+      if (s.type !== "station" || s.dead) continue;
+
+      const dx = player.x - s.x;
+      const dy = player.y - s.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 1350) continue;
+
+      s.spawn = (s.spawn ?? CFG.miniSpawnEvery) - dt;
+      if (s.spawn > 0) continue;
+
+      spawnMiniFighter(s);
+
+      const pressure = clamp((1400 - d) / 1400, 0.35, 1);
+      s.spawn = CFG.miniSpawnEvery / pressure;
+    }
+  }
+
+  function enemyAI(dt) {
+    if (!player || player.dead) return;
+
+    for (const e of bodies) {
+      if ((e.type !== "enemy" && e.type !== "station" && e.type !== "mini") || e.dead) continue;
+
+      const dx = player.x - e.x;
+      const dy = player.y - e.y;
+      const d = Math.hypot(dx, dy) || 1;
+      if (d > 1500) continue;
+
+      const nx = dx / d;
+      const ny = dy / d;
+
+      if (e.type === "mini") {
+        // Mini fighters behave like hostile small player ships:
+        // they run toward you, then jitter-strafe while shooting.
+        const desired = 170;
+        const chase = clamp((d - desired) / desired, -0.20, 1.25);
+        const wiggle = Math.sin(time * 5.2 + e.phase) * 0.38;
+        const ax = nx * chase + (-ny) * wiggle;
+        const ay = ny * chase + nx * wiggle;
+        const len = Math.hypot(ax, ay) || 1;
+
+        e.vx += (ax / len) * CFG.miniChaseAccel * dt;
+        e.vy += (ay / len) * CFG.miniChaseAccel * dt;
+        e.aim = Math.atan2(dy, dx);
+
+        const s = Math.hypot(e.vx, e.vy);
+        if (s > CFG.miniMaxSpeed) {
+          e.vx = e.vx / s * CFG.miniMaxSpeed;
+          e.vy = e.vy / s * CFG.miniMaxSpeed;
+        }
+      } else if (e.type === "enemy") {
+        // Chase the player, but try not to ram constantly:
+        // close when far, strafe/orbit when at preferred range.
+        const preferred = CFG.enemyPreferredRange;
+        const chase = clamp((d - preferred) / preferred, -0.45, 1);
+        const orbit = Math.sin(time * 1.3 + e.phase) * 0.72;
+
+        const ax = nx * chase + (-ny) * orbit;
+        const ay = ny * chase + nx * orbit;
+        const len = Math.hypot(ax, ay) || 1;
+
+        e.vx += (ax / len) * CFG.enemyChaseAccel * dt;
+        e.vy += (ay / len) * CFG.enemyChaseAccel * dt;
+
+        const s = Math.hypot(e.vx, e.vy);
+        if (s > CFG.enemyMaxSpeed) {
+          e.vx = e.vx / s * CFG.enemyMaxSpeed;
+          e.vy = e.vy / s * CFG.enemyMaxSpeed;
+        }
+      } else {
+        // Stations are heavy gun platforms: they drift toward the player slowly.
+        const stationAccel = CFG.enemyChaseAccel * 0.22;
+        e.vx += nx * stationAccel * dt;
+        e.vy += ny * stationAccel * dt;
+
+        const s = Math.hypot(e.vx, e.vy);
+        const max = CFG.enemyMaxSpeed * 0.38;
+        if (s > max) {
+          e.vx = e.vx / s * max;
+          e.vy = e.vy / s * max;
+        }
+      }
+    }
+  }
+
+  function shoot(dt) {
+    playerFire -= dt;
+    if (player && !player.dead && playerFire <= 0) {
+      const angle = player.aim ?? -Math.PI / 2;
+      spawnBullet(player, angle, CFG.bulletSpeed + Math.min(120, score * .03), true);
+      playerFire = CFG.playerShootEvery;
+    }
+
+    let activeEnemies = 0;
+    for (const e of bodies) {
+      if ((e.type === "enemy" || e.type === "station" || e.type === "mini") && !e.dead) activeEnemies++;
+    }
+
+    for (const e of bodies) {
+      if ((e.type !== "enemy" && e.type !== "station" && e.type !== "mini") || e.dead) continue;
+      const dx = player.x - e.x, dy = player.y - e.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 1150) continue;
+
+      e.shoot -= dt;
+      if (e.shoot > 0) continue;
+
+      const base = Math.atan2(dy, dx);
+      const danger = clamp((1400 - d) / 1400, .25, 1);
+      const distLevel = Math.floor(Math.hypot(player.x, player.y) / 900);
+      const spiral = time * (0.85 + distLevel * 0.025) + e.phase;
+
+      // Lead the player slightly: targeted bullets aim where the ship is moving.
+      const leadTime = clamp(d / (e.type === "mini" ? 640 : 520), 0.18, 1.35);
+      const leadX = player.x + player.vx * leadTime;
+      const leadY = player.y + player.vy * leadTime;
+      const aimed = Math.atan2(leadY - e.y, leadX - e.x);
+
+      if (e.type === "mini") {
+        // Mini fighters shoot like small hostile player ships:
+        // fewer bullets, but direct and persistent.
+        spawnBullet(e, aimed, CFG.enemyBulletSpeed * 1.05 + distLevel * 1.8, false);
+        if (d < 420) {
+          spawnBullet(e, aimed + 0.10, CFG.enemyBulletSpeed * .96, false);
+          spawnBullet(e, aimed - 0.10, CFG.enemyBulletSpeed * .96, false);
+        }
+        e.shoot = Math.max(.42, CFG.miniShootEvery - distLevel * .025) / danger;
+        continue;
+      }
+
+      // Main targeted volley: narrow, direct, dangerous.
+      const aimedCount = e.type === "station" ? 5 : 3;
+      for (let k = 0; k < aimedCount; k++) {
+        const t = (k - (aimedCount - 1) / 2) * 0.075;
+        spawnBullet(e, aimed + t, CFG.enemyBulletSpeed + distLevel * 2.4, false);
+      }
+
+      // Secondary bullet-hell fan: slower but denser, keeps space pressure.
+      const spread = e.type === "station" ? 10 : 4 + Math.min(7, Math.floor(distLevel / 2));
+      for (let k = 0; k < spread; k++) {
+        const t = (k - (spread - 1) / 2) * (e.type === "station" ? .36 : .19);
+        spawnBullet(e, base + t + Math.sin(spiral) * 0.18, CFG.enemyBulletSpeed * .78 + distLevel * 1.6, false);
+      }
+
+      // Stations add radial crossfire.
+      if (distLevel > 2 || e.type === "station") {
+        spawnBullet(e, spiral, CFG.enemyBulletSpeed * .95, false);
+        spawnBullet(e, spiral + Math.PI, CFG.enemyBulletSpeed * .95, false);
+        if (e.type === "station") {
+          spawnBullet(e, spiral + Math.PI / 2, CFG.enemyBulletSpeed * .82, false);
+          spawnBullet(e, spiral - Math.PI / 2, CFG.enemyBulletSpeed * .82, false);
+        }
+      }
+
+      e.shoot = Math.max(.30, CFG.enemyShootEvery - distLevel * .045) / danger;
+    }
+  }
+
+  function cleanup() {
+    const px = player.x, py = player.y;
+    const far2 = CFG.unloadDistance * CFG.unloadDistance;
+
+    bodies = bodies.filter(b => {
+      if (b === player) return true;
+      if (b.dead) return false;
+
+      const dx = b.x - px, dy = b.y - py;
+      const d2 = dx * dx + dy * dy;
+
+      if (b.type === "pbullet" || b.type === "ebullet") {
+        const life = b.type === "pbullet" ? 9.5 : 7.2;
+        const range = b.type === "pbullet" ? far2 * .72 : far2 * .50;
+        if (b.age > life) return false;
+        if (d2 > range) return false;
+      }
+
+      if (d2 > far2) return false;
+      if (b.chunk && !loadedChunks.has(b.chunk) && d2 > far2 * .38) return false;
+      return true;
+    });
+
+    const counts = countBodies();
+
+    // If bullets exceed cap, remove enemy bullets first in one pass.
+    if (counts.bullet > CFG.maxActiveBullets) {
+      const overflow = counts.bullet - CFG.maxActiveBullets;
+      const disposable = [];
+      for (let i = 0; i < bodies.length; i++) {
+        const b = bodies[i];
+        if (b.type !== "pbullet" && b.type !== "ebullet") continue;
+        disposable.push([b.type === "ebullet" ? 1 : 0, bodyPriority(b, "bullet-cap"), i]);
+      }
+      disposable.sort((a, b) => (b[0] - a[0]) || (b[1] - a[1]));
+      const remove = new Set(disposable.slice(0, overflow).map(x => x[2]));
+      bodies = bodies.filter((_, i) => !remove.has(i));
+    }
+
+    if (bodies.length > CFG.maxBodies * 1.06) enforceBodyBudget("cleanup");
+  }
+
+  function updateCamera(dt) {
+    const speed = Math.hypot(player.vx, player.vy);
+    const look = 0.18;
+    const targetX = player.x + player.vx * look;
+    const targetY = player.y + player.vy * look;
+    camera.x = lerp(camera.x, targetX, 1 - Math.pow(.001, dt));
+    camera.y = lerp(camera.y, targetY, 1 - Math.pow(.001, dt));
+    camera.scale = lerp(camera.scale, clamp(1.12 - speed / 2200, .90, 1.10), 1 - Math.pow(.03, dt));
+  }
+
+  function step(dt) {
+    time += dt;
+    score += dt * 1.2 + Math.hypot(player.vx, player.vy) * dt * .006;
+
+    loadWorldAroundPlayer();
+    if (bodies.length > CFG.maxBodies * 1.06) enforceBodyBudget("pre-step");
+    controls(dt);
+    stationSpawning(dt);
+    enemyAI(dt);
+    applyGravity(dt);
+    shoot(dt);
+    collide();
+    cleanup();
+    updateCamera(dt);
+
+    if (!player || player.dead || player.hp <= 0) gameOver();
+  }
+
+  function starColor(t) {
+    // Rough black-body inspired palette, simplified for tiny dots:
+    // cool red/orange, sun-like white/yellow, hot blue-white.
+    if (t < 0.18) return "rgba(255,135,105,";
+    if (t < 0.34) return "rgba(255,185,130,";
+    if (t < 0.70) return "rgba(245,248,255,";
+    if (t < 0.88) return "rgba(205,225,255,";
+    return "rgba(150,190,255,";
+  }
+
+  function drawParallaxStars() {
+    // Three pseudo-3D layers. Smaller depth value = farther away.
+    // Stars are generated from integer grid cells, so the field is infinite
+    // and stable as the camera moves.
+    const layers = [
+      { depth: 0.10, step: 190, alpha: 0.34, size: 0.75, salt: 11 },
+      { depth: 0.24, step: 145, alpha: 0.42, size: 1.05, salt: 29 },
+      { depth: 0.48, step: 105, alpha: 0.55, size: 1.45, salt: 47 },
+      { depth: 0.78, step: 82,  alpha: 0.42, size: 1.80, salt: 71 },
+    ];
+
+    for (const layer of layers) {
+      const step = layer.step;
+      const depth = layer.depth;
+
+      // Convert screen bounds into this layer's parallax coordinate space.
+      const left = camera.x * depth - W / 2 / camera.scale - step;
+      const right = camera.x * depth + W / 2 / camera.scale + step;
+      const top = camera.y * depth - H / 2 / camera.scale - step;
+      const bottom = camera.y * depth + H / 2 / camera.scale + step;
+
+      const x0 = Math.floor(left / step);
+      const x1 = Math.ceil(right / step);
+      const y0 = Math.floor(top / step);
+      const y1 = Math.ceil(bottom / step);
+
+      for (let cy = y0; cy <= y1; cy++) {
+        for (let cx = x0; cx <= x1; cx++) {
+          const density = rng2(cx, cy, layer.salt + 100);
+          if (density < 0.18) continue;
+
+          const wx = (cx + rng2(cx, cy, layer.salt)) * step;
+          const wy = (cy + rng2(cx, cy, layer.salt + 1)) * step;
+
+          // Parallax projection. Near layers move more than far layers.
+          const sx = (wx - camera.x * depth) * camera.scale + W / 2;
+          const sy = (wy - camera.y * depth) * camera.scale + H / 2;
+
+          if (sx < -4 || sx > W + 4 || sy < -4 || sy > H + 4) continue;
+
+          const temp = rng2(cx, cy, layer.salt + 2);
+          const twinkle = 0.78 + 0.22 * Math.sin(time * (0.8 + depth * 2.4) + rng2(cx, cy, layer.salt + 3) * TAU);
+          const bright = layer.alpha * twinkle * (0.65 + rng2(cx, cy, layer.salt + 4) * 0.55);
+          const size = layer.size * camera.scale * (0.75 + rng2(cx, cy, layer.salt + 5) * 0.9);
+
+          ctx.fillStyle = starColor(temp) + bright.toFixed(3) + ")";
+          ctx.beginPath();
+          ctx.arc(sx, sy, size, 0, TAU);
+          ctx.fill();
+
+          // Occasional brighter glow star.
+          if (density > 0.985) {
+            ctx.fillStyle = starColor(temp) + (bright * 0.18).toFixed(3) + ")";
+            ctx.beginPath();
+            ctx.arc(sx, sy, size * 3.2, 0, TAU);
+            ctx.fill();
+          }
+        }
+      }
+    }
+  }
+
+  function drawBackground() {
+    ctx.fillStyle = "#06070b";
+    ctx.fillRect(0, 0, W, H);
+
+    drawParallaxStars();
+
+    // Chunk grid, very faint.
+    ctx.strokeStyle = "rgba(160,180,255,.035)";
+    ctx.lineWidth = 1;
+    const c = CFG.chunk;
+    const left = camera.x - W / 2 / camera.scale;
+    const top = camera.y - H / 2 / camera.scale;
+    const right = camera.x + W / 2 / camera.scale;
+    const bottom = camera.y + H / 2 / camera.scale;
+    for (let x = Math.floor(left / c) * c; x <= right; x += c) {
+      const a = screenFromWorld(x, top), b = screenFromWorld(x, bottom);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    for (let y = Math.floor(top / c) * c; y <= bottom; y += c) {
+      const a = screenFromWorld(left, y), b = screenFromWorld(right, y);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+  }
+
+  function inView(b, margin = 140) {
+    const p = screenFromWorld(b.x, b.y);
+    return p.x > -margin && p.x < W + margin && p.y > -margin && p.y < H + margin;
+  }
+
+  function getLightSources() {
+    const lights = [];
+    for (const b of bodies) {
+      if ((b.type === "pbullet" || b.type === "ebullet") && !b.dead && inView(b, CFG.lightRange + 80)) {
+        lights.push(b);
+      }
+    }
+
+    // Keep nearest / newest-ish visible lights by limiting the list.
+    // This is cheaper than lighting every object against every bullet.
+    if (lights.length > CFG.maxLightSources) {
+      lights.sort((a, b) => {
+        const da = (a.x - camera.x) ** 2 + (a.y - camera.y) ** 2;
+        const db = (b.x - camera.x) ** 2 + (b.y - camera.y) ** 2;
+        return da - db;
+      });
+      lights.length = CFG.maxLightSources;
+    }
+
+    return lights;
+  }
+
+  function lightAt(x, y, lights) {
+    let v = CFG.lightSoftness;
+
+    for (const l of lights) {
+      const dx = l.x - x;
+      const dy = l.y - y;
+      const d2 = dx * dx + dy * dy;
+      const r = CFG.lightRange * (l.type === "pbullet" ? 0.82 : 1.0);
+      const r2 = r * r;
+      if (d2 > r2) continue;
+
+      const q = 1 - d2 / r2;
+      v += q * q * (l.type === "pbullet" ? 0.62 : 0.82);
+    }
+
+    return clamp(v, 0.12, 1.85);
+  }
+
+  function lit(alpha, light, floor = 0.12) {
+    return clamp(alpha * (floor + light), 0, 1);
+  }
+
+  function litWhite(alpha, light) {
+    return `rgba(245,248,255,${lit(alpha, light).toFixed(3)})`;
+  }
+
+  function litPink(alpha, light) {
+    return `rgba(255,111,152,${lit(alpha, light).toFixed(3)})`;
+  }
+
+  function litPlanet(alpha, light) {
+    return `rgba(190,210,255,${lit(alpha, light).toFixed(3)})`;
+  }
+
+  function drawLightGlow(b) {
+    const s = screenFromWorld(b.x, b.y);
+    const r = (b.type === "pbullet" ? 58 : 74) * camera.scale;
+    const core = b.type === "pbullet"
+      ? "rgba(190,235,255,"
+      : "rgba(255,120,165,";
+
+    const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r);
+    g.addColorStop(0, core + "0.30)");
+    g.addColorStop(0.24, core + "0.12)");
+    g.addColorStop(1, core + "0)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, r, 0, TAU);
+    ctx.fill();
+  }
+
+  function drawBody(b, lights) {
+    const s = screenFromWorld(b.x, b.y);
+    const light = (b.type === "pbullet" || b.type === "ebullet") ? 1.25 : lightAt(b.x, b.y, lights);
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.scale(camera.scale, camera.scale);
+
+    if (b.type === "player") {
+      const ang = (b.aim ?? Math.atan2(b.vy, b.vx || -0.001)) + Math.PI / 2;
+      ctx.rotate(ang);
+      ctx.strokeStyle = litWhite(0.95, light);
+      ctx.lineWidth = 2 / camera.scale;
+      ctx.beginPath();
+      ctx.moveTo(0, -13);
+      ctx.lineTo(9, 10);
+      ctx.lineTo(0, 5);
+      ctx.lineTo(-9, 10);
+      ctx.closePath();
+      ctx.stroke();
+
+      ctx.strokeStyle = `rgba(135,185,255,${lit(0.92, light).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.arc(0, 0, b.r, 0, TAU);
+      ctx.stroke();
+    } else if (b.type === "enemy") {
+      ctx.rotate(time * .8 + b.phase);
+      ctx.strokeStyle = litPink(0.95, light);
+      ctx.lineWidth = 2 / camera.scale;
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = i / 6 * TAU;
+        const r = i % 2 ? b.r * .72 : b.r * 1.18;
+        const x = Math.cos(a) * r, y = Math.sin(a) * r;
+        i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      }
+      ctx.closePath();
+      ctx.stroke();
+
+      if (b.maxHp) {
+        ctx.rotate(-(time * .8 + b.phase));
+        ctx.strokeStyle = `rgba(255,111,152,${lit(0.28, light).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(0, 0, b.r * 1.55, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(b.hp / b.maxHp, 0, 1));
+        ctx.stroke();
+      }
+    } else if (b.type === "mini") {
+      const ang = (b.aim ?? Math.atan2(b.vy, b.vx || -0.001)) + Math.PI / 2;
+      ctx.rotate(ang);
+      ctx.strokeStyle = `rgba(255,176,198,${lit(0.95, light).toFixed(3)})`;
+      ctx.lineWidth = 1.7 / camera.scale;
+      ctx.beginPath();
+      ctx.moveTo(0, -9);
+      ctx.lineTo(6.5, 7);
+      ctx.lineTo(0, 3.5);
+      ctx.lineTo(-6.5, 7);
+      ctx.closePath();
+      ctx.stroke();
+
+      if (b.maxHp) {
+        ctx.strokeStyle = `rgba(255,176,198,${lit(0.25, light).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(0, 0, b.r * 1.65, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(b.hp / b.maxHp, 0, 1));
+        ctx.stroke();
+      }
+    } else if (b.type === "station") {
+      ctx.rotate(-time * .32 + b.phase);
+      ctx.strokeStyle = `rgba(255,154,188,${lit(0.95, light).toFixed(3)})`;
+      ctx.lineWidth = 2 / camera.scale;
+      ctx.strokeRect(-b.r * .75, -b.r * .75, b.r * 1.5, b.r * 1.5);
+      ctx.beginPath();
+      ctx.arc(0, 0, b.r * .48, 0, TAU);
+      ctx.stroke();
+
+      if (b.maxHp) {
+        ctx.strokeStyle = `rgba(255,154,188,${lit(0.25, light).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(0, 0, b.r * 1.05, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(b.hp / b.maxHp, 0, 1));
+        ctx.stroke();
+      }
+    } else if (b.type === "planet") {
+      ctx.strokeStyle = litPlanet(0.58, light);
+      ctx.lineWidth = 1.5 / camera.scale;
+      ctx.beginPath(); ctx.arc(0, 0, b.r, 0, TAU); ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, 0, b.r * .45, 0, TAU); ctx.stroke();
+    } else if (b.type === "asteroid") {
+      ctx.rotate(b.phase + b.age * .4);
+      ctx.strokeStyle = `rgba(210,220,255,${lit(0.42, light).toFixed(3)})`;
+      ctx.lineWidth = 1.4 / camera.scale;
+      ctx.beginPath();
+      for (let i = 0; i < 7; i++) {
+        const a = i / 7 * TAU;
+        const r = b.r * (.78 + .34 * Math.sin(i * 7.1 + b.phase));
+        const x = Math.cos(a) * r, y = Math.sin(a) * r;
+        i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      }
+      ctx.closePath(); ctx.stroke();
+    } else if (b.type === "chunk") {
+      ctx.strokeStyle = litPlanet(0.46, light);
+      ctx.lineWidth = 1.2 / camera.scale;
+      ctx.beginPath();
+      ctx.arc(0, 0, b.r, 0, TAU);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(0, 0, b.r * .38, 0, TAU);
+      ctx.stroke();
+    } else {
+      // Bullets are rendered only by their light glow pass.
+      // Keep no solid core circle here.
+    }
+
+    ctx.restore();
+  }
+
+  function drawPlayerHealthBar() {
+    if (!player) return;
+
+    const max = player.maxHp || 5;
+    const value = clamp(player.hp / max, 0, 1);
+    const x = 12;
+    const y = 34;
+    const w = 94;
+    const h = 5;
+
+    ctx.save();
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.globalAlpha = 0.92;
+
+    ctx.strokeStyle = "rgba(255,255,255,.55)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, w, h);
+
+    ctx.fillStyle = "rgba(255,255,255,.92)";
+    ctx.fillRect(x, y, w * value, h);
+
+    ctx.restore();
+  }
+
+  function render() {
+    ctx.save();
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    drawBackground();
+
+    if (shake > .1) {
+      ctx.translate(rand(-shake, shake), rand(-shake, shake));
+      shake *= .86;
+    }
+
+    const lights = getLightSources();
+
+    // Additive-looking bullet glow pass.
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const b of lights) drawLightGlow(b);
+    ctx.restore();
+
+    // Gravity fields for nearby heavy bodies.
+    for (const b of bodies) {
+      if (!inView(b, 320)) continue;
+      if (b.type === "planet" || b.type === "enemy" || b.type === "station" || b.type === "mini" || b.type === "player") {
+        const p = screenFromWorld(b.x, b.y);
+        ctx.strokeStyle = b.type === "enemy" || b.type === "station" || b.type === "mini"
+          ? "rgba(255,100,150,.08)"
+          : "rgba(150,180,255,.065)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, (Math.sqrt(b.mass) * 19 + b.r) * camera.scale, 0, TAU);
+        ctx.stroke();
+      }
+    }
+
+    for (const b of bodies) {
+      if (inView(b)) drawBody(b, lights);
+    }
+
+    if (pointer.active && player) {
+      const ps = screenFromWorld(player.x, player.y);
+      ctx.strokeStyle = "rgba(255,255,255,.10)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pointer.x, pointer.y);
+      ctx.lineTo(ps.x, ps.y);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+
+    drawPlayerHealthBar();
+    hud.textContent = "SCORE " + Math.floor(score);
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(1 / 30, (now - last) / 1000);
+    last = now;
+    if (running) step(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  function pointFromEvent(e) {
+    const t = e.touches ? e.touches[0] : e;
+    return { x: t.clientX, y: t.clientY };
+  }
+
+  function down(e) {
+    e.preventDefault();
+    if (!running) reset();
+    const p = pointFromEvent(e);
+    pointer.active = true;
+    pointer.x = p.x;
+    pointer.y = p.y;
+  }
+  function move(e) {
+    e.preventDefault();
+    const p = pointFromEvent(e);
+    pointer.active = true;
+    pointer.x = p.x;
+    pointer.y = p.y;
+  }
+  function up(e) {
+    e.preventDefault();
+    pointer.active = false;
+  }
+
+  canvas.addEventListener("touchstart", down, { passive: false });
+  canvas.addEventListener("touchmove", move, { passive: false });
+  canvas.addEventListener("touchend", up, { passive: false });
+  canvas.addEventListener("touchcancel", up, { passive: false });
+  hint.addEventListener("touchstart", down, { passive: false });
+
+  canvas.addEventListener("pointerdown", down);
+  canvas.addEventListener("pointermove", e => { if (e.buttons || pointer.active) move(e); });
+  canvas.addEventListener("pointerup", up);
+  hint.addEventListener("pointerdown", down);
+
+  document.addEventListener("gesturestart", e => e.preventDefault());
+})();
+</script>
+</body>
+</html>
