@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Cursor Pen</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: white;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    overscroll-behavior: none;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100dvw;
+    height: 100dvh;
+    touch-action: none;
+  }
+
+  #hud {
+    position: fixed;
+    left: max(10px, env(safe-area-inset-left));
+    right: max(10px, env(safe-area-inset-right));
+    bottom: max(10px, env(safe-area-inset-bottom));
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    pointer-events: none;
+    color: #111;
+    font-size: 12px;
+    opacity: .95;
+    z-index: 10;
+  }
+
+  .pill {
+    pointer-events: auto;
+    border: 1px solid rgba(0,0,0,.18);
+    background: rgba(255,255,255,.75);
+    color: #111;
+    border-radius: 999px;
+    padding: 9px 12px;
+    box-shadow: 0 2px 18px rgba(0,0,0,.08);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  button.pill {
+    font: inherit;
+  }
+
+  input[type="range"] {
+    pointer-events: auto;
+    width: 112px;
+    accent-color: #111;
+  }
+
+  input[type="color"] {
+    pointer-events: auto;
+    width: 42px;
+    height: 36px;
+    padding: 3px;
+    border-radius: 999px;
+  }
+
+  #hint {
+    position: fixed;
+    top: max(12px, env(safe-area-inset-top));
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(0,0,0,.62);
+    font-size: 12px;
+    text-align: center;
+    pointer-events: none;
+    line-height: 1.35;
+    padding: 8px 12px;
+    border-radius: 999px;
+    background: rgba(255,255,255,.7);
+    border: 1px solid rgba(0,0,0,.1);
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="paint"></canvas>
+<canvas id="ui"></canvas>
+
+<div id="hint">Right finger moves cursor · Left finger holds pen down</div>
+
+<div id="hud">
+  <button class="pill" id="clear">clear</button>
+  <button class="pill" id="undo">undo</button>
+  <input class="pill" id="color" type="color" value="#111111" aria-label="color">
+  <span class="pill">size <span id="sizeText">18</span></span>
+  <input id="size" type="range" min="0" max="80" value="18">
+</div>
+
+<script>
+(() => {
+  const paint = document.getElementById("paint");
+  const ui = document.getElementById("ui");
+  const hud = document.getElementById("hud");
+  const p = paint.getContext("2d", { alpha: false });
+  const u = ui.getContext("2d");
+  const sizeSlider = document.getElementById("size");
+  const sizeText = document.getElementById("sizeText");
+  const colorInput = document.getElementById("color");
+
+  let dpr = 1;
+  let W = 0, H = 0;       // CSS pixel size
+  let BW = 0, BH = 0;     // backing-store pixel size
+  let brush = +sizeSlider.value; // device-pixel brush size, not CSS-pixel size
+  let color = colorInput.value;
+
+  const cursor = { x: innerWidth * 0.55, y: innerHeight * 0.5 };
+  let last = { x: cursor.x, y: cursor.y };
+  let drawing = false;
+  let controlId = null;
+  let penId = null;
+  let dirtyUI = true;
+  let controlOffset = { x: -100, y: -80 };
+
+  const undo = [];
+  const UNDO_MAX = 12;
+
+  function cssRadius() {
+    // Slider value is in backing/device pixels.
+    // Because contexts are scaled by DPR, divide by DPR for drawing commands.
+    // Size 0 is a 1-device-pixel hairline.
+    return Math.max(1, brush) / dpr / 2;
+  }
+
+  function cssLineWidth() {
+    // Size 0 and 1 both resolve to a 1-device-pixel stroke.
+    return Math.max(1, brush) / dpr;
+  }
+
+  function canvasCssSize() {
+    const vv = window.visualViewport;
+    return {
+      w: Math.round(vv?.width || window.innerWidth),
+      h: Math.round(vv?.height || window.innerHeight)
+    };
+  }
+
+  function setupContext(ctx) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+  }
+
+  function setCanvasResolution(c, ctx) {
+    c.width = BW;
+    c.height = BH;
+    c.style.width = W + "px";
+    c.style.height = H + "px";
+    setupContext(ctx);
+  }
+
+  function resize() {
+    const oldPaint = document.createElement("canvas");
+    const oldW = W;
+    const oldH = H;
+    if (paint.width && paint.height) {
+      oldPaint.width = paint.width;
+      oldPaint.height = paint.height;
+      oldPaint.getContext("2d").drawImage(paint, 0, 0);
+    }
+
+    const size = canvasCssSize();
+    W = size.w;
+    H = size.h;
+
+    dpr = Math.max(1, Math.min(4, window.devicePixelRatio || 1));
+    BW = Math.max(1, Math.round(W * dpr));
+    BH = Math.max(1, Math.round(H * dpr));
+
+    setCanvasResolution(paint, p);
+    setCanvasResolution(ui, u);
+
+    p.fillStyle = "white";
+    p.fillRect(0, 0, W, H);
+
+    if (oldPaint.width && oldPaint.height && oldW && oldH) {
+      p.drawImage(oldPaint, 0, 0, oldPaint.width, oldPaint.height, 0, 0, oldW, oldH);
+    }
+
+    const r = cssRadius();
+    cursor.x = Math.max(r, Math.min(W - r, cursor.x));
+    cursor.y = Math.max(r, Math.min(H - r, cursor.y));
+    last.x = cursor.x;
+    last.y = cursor.y;
+
+    dirtyUI = true;
+  }
+
+  function saveUndo() {
+    try {
+      if (undo.length >= UNDO_MAX) undo.shift();
+      undo.push(p.getImageData(0, 0, BW, BH));
+    } catch {}
+  }
+
+  function restoreUndo() {
+    const img = undo.pop();
+    if (img) {
+      p.save();
+      p.setTransform(1, 0, 0, 1, 0, 0);
+      p.putImageData(img, 0, 0);
+      p.restore();
+      setupContext(p);
+    }
+    dirtyUI = true;
+  }
+
+  function clearCanvas() {
+    saveUndo();
+    p.fillStyle = "white";
+    p.fillRect(0, 0, W, H);
+    dirtyUI = true;
+  }
+
+  function makeOffset(e) {
+    const dx = Math.min(120, W * 0.22);
+    const dy = -Math.min(95, H * 0.14);
+    return { x: e.clientX >= W * 0.5 ? -dx : dx, y: dy };
+  }
+
+  function tipFromPointer(e, offset = controlOffset) {
+    const r = cssRadius();
+    return {
+      x: Math.max(r, Math.min(W - r, e.clientX + offset.x)),
+      y: Math.max(r, Math.min(H - r, e.clientY + offset.y))
+    };
+  }
+
+  function drawLine(a, b) {
+    const w = cssLineWidth();
+
+    p.lineCap = "round";
+    p.lineJoin = "round";
+    p.strokeStyle = color;
+    p.lineWidth = w;
+    p.beginPath();
+    p.moveTo(a.x, a.y);
+    p.lineTo(b.x, b.y);
+    p.stroke();
+
+    // Slight darkening core only for larger brushes. Still DPR-independent.
+    if (brush >= 6) {
+      p.globalAlpha = .92;
+      p.lineWidth = Math.max(1 / dpr, w * 0.7);
+      p.beginPath();
+      p.moveTo(a.x, a.y);
+      p.lineTo(b.x, b.y);
+      p.stroke();
+      p.globalAlpha = 1;
+    }
+  }
+
+  function assignControl(e) {
+    controlId = e.pointerId;
+    controlOffset = makeOffset(e);
+    const tip = tipFromPointer(e, controlOffset);
+    cursor.x = last.x = tip.x;
+    cursor.y = last.y = tip.y;
+  }
+
+  function assignPen(e) {
+    penId = e.pointerId;
+    if (!drawing) {
+      saveUndo();
+      drawing = true;
+      last.x = cursor.x;
+      last.y = cursor.y;
+    }
+  }
+
+  function canvasPointerDown(e) {
+    if (e.pointerType === "mouse") return;
+    e.preventDefault();
+
+    try { ui.setPointerCapture(e.pointerId); } catch {}
+
+    const isLeft = e.clientX < W * 0.5;
+    const isRight = !isLeft;
+
+    if (isRight && controlId === null) assignControl(e);
+    else if (isLeft && penId === null) assignPen(e);
+    else if (controlId === null) assignControl(e);
+    else if (penId === null) assignPen(e);
+
+    dirtyUI = true;
+  }
+
+  function canvasPointerMove(e) {
+    if (e.pointerId !== controlId) return;
+    e.preventDefault();
+
+    const next = tipFromPointer(e);
+    if (drawing) drawLine(last, next);
+    last.x = cursor.x = next.x;
+    last.y = cursor.y = next.y;
+    dirtyUI = true;
+  }
+
+  function canvasPointerEnd(e) {
+    if (e.pointerId === controlId) controlId = null;
+    if (e.pointerId === penId) {
+      penId = null;
+      drawing = false;
+    }
+    dirtyUI = true;
+  }
+
+  function drawUI() {
+    if (!dirtyUI) return;
+    dirtyUI = false;
+    u.clearRect(0, 0, W, H);
+
+    u.strokeStyle = "rgba(0,0,0,.08)";
+    u.lineWidth = 1 / dpr;
+    u.setLineDash([4, 8]);
+    u.beginPath();
+    u.moveTo(W / 2, 0);
+    u.lineTo(W / 2, H);
+    u.stroke();
+    u.setLineDash([]);
+
+    const r = Math.max(2 / dpr, cssRadius());
+
+    u.lineWidth = Math.max(1 / dpr, 1.5 / dpr);
+    u.strokeStyle = drawing ? color : "rgba(0,0,0,.55)";
+    u.fillStyle = drawing ? hexToRgba(color, .13) : "rgba(0,0,0,.035)";
+    u.beginPath();
+    u.arc(cursor.x, cursor.y, r, 0, Math.PI * 2);
+    u.fill();
+    u.stroke();
+
+    u.strokeStyle = drawing ? color : "rgba(0,0,0,.7)";
+    u.lineWidth = 1 / dpr;
+    u.beginPath();
+    u.moveTo(cursor.x - 6, cursor.y);
+    u.lineTo(cursor.x + 6, cursor.y);
+    u.moveTo(cursor.x, cursor.y - 6);
+    u.lineTo(cursor.x, cursor.y + 6);
+    u.stroke();
+
+    if (controlId !== null) {
+      u.fillStyle = "rgba(0,0,0,.45)";
+      u.font = "12px system-ui";
+      u.textAlign = "right";
+      u.fillText("cursor", W - 14, 24);
+    }
+    if (penId !== null) {
+      u.fillStyle = "rgba(0,0,0,.75)";
+      u.font = "12px system-ui";
+      u.textAlign = "left";
+      u.fillText("pen down", 14, 24);
+    }
+  }
+
+  function hexToRgba(hex, alpha) {
+    const n = parseInt(hex.slice(1), 16);
+    const r = (n >> 16) & 255;
+    const g = (n >> 8) & 255;
+    const b = n & 255;
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
+
+  function loop() {
+    drawUI();
+    requestAnimationFrame(loop);
+  }
+
+  function stopHudPointer(e) {
+    e.stopPropagation();
+  }
+
+  hud.addEventListener("pointerdown", stopHudPointer, { passive: true });
+  hud.addEventListener("pointermove", stopHudPointer, { passive: true });
+  hud.addEventListener("pointerup", stopHudPointer, { passive: true });
+  hud.addEventListener("pointercancel", stopHudPointer, { passive: true });
+
+  sizeSlider.addEventListener("input", () => {
+    brush = +sizeSlider.value;
+    sizeText.textContent = brush;
+    dirtyUI = true;
+  });
+
+  colorInput.addEventListener("input", () => {
+    color = colorInput.value;
+    dirtyUI = true;
+  });
+
+  document.getElementById("clear").addEventListener("click", clearCanvas);
+  document.getElementById("undo").addEventListener("click", restoreUndo);
+
+  ui.addEventListener("pointerdown", canvasPointerDown, { passive: false });
+  ui.addEventListener("pointermove", canvasPointerMove, { passive: false });
+  ui.addEventListener("pointerup", canvasPointerEnd, { passive: false });
+  ui.addEventListener("pointercancel", canvasPointerEnd, { passive: false });
+  ui.addEventListener("lostpointercapture", canvasPointerEnd, { passive: false });
+
+  addEventListener("resize", resize);
+  addEventListener("orientationchange", () => setTimeout(resize, 80));
+  if (window.visualViewport) {
+    visualViewport.addEventListener("resize", resize);
+    visualViewport.addEventListener("scroll", () => { dirtyUI = true; });
+  }
+
+  resize();
+  loop();
+})();
+</script>
+</body>
+</html>
