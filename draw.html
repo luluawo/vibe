@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tiny Drawing App</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f1ea;
+      color: #2b2620;
+      overflow: hidden;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+      padding: 0.75rem;
+      background: rgba(255, 255, 255, 0.78);
+      border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+      z-index: 1;
+    }
+
+    .toolbar label {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.9rem;
+      white-space: nowrap;
+    }
+
+    button, input[type="color"] {
+      border: 0;
+      border-radius: 999px;
+      cursor: pointer;
+    }
+
+    button {
+      padding: 0.55rem 0.8rem;
+      background: #2b2620;
+      color: white;
+      font-weight: 650;
+    }
+
+    button.secondary {
+      background: white;
+      color: #2b2620;
+      border: 1px solid rgba(0, 0, 0, 0.14);
+    }
+
+    button.active {
+      background: #c26a45;
+      color: white;
+    }
+
+    input[type="range"] {
+      width: 120px;
+    }
+
+    input[type="color"] {
+      width: 42px;
+      height: 34px;
+      padding: 0;
+      background: transparent;
+    }
+
+    .stage {
+      position: relative;
+      min-height: 0;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: white;
+      cursor: crosshair;
+      touch-action: none;
+    }
+
+    .hint {
+      margin-left: auto;
+      opacity: 0.65;
+      font-size: 0.85rem;
+    }
+
+    .export-panel {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: grid;
+      place-items: center;
+      padding: 1rem;
+      background: rgba(0, 0, 0, 0.35);
+    }
+
+    .export-panel[hidden] {
+      display: none;
+    }
+
+    .export-card {
+      max-width: min(92vw, 900px);
+      max-height: 88vh;
+      overflow: auto;
+      padding: 1rem;
+      border-radius: 24px;
+      background: white;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+    }
+
+    .export-card img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      border: 1px solid rgba(0, 0, 0, 0.12);
+      background: white;
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <label>
+      Color
+      <input id="color" type="color" value="#222222" />
+    </label>
+
+    <label>
+      Size
+      <input id="size" type="range" min="1" max="80" value="8" />
+      <span id="sizeValue">8</span>
+    </label>
+
+    <button id="pen" class="active">Pen</button>
+    <button id="eraser" class="secondary">Eraser</button>
+    <button id="undo" class="secondary">Undo</button>
+    <button id="clear" class="secondary">Clear</button>
+    <button id="save">Save PNG</button>
+    <span id="status" class="hint"></span>
+
+    <span class="hint">Draw with mouse, pen, or touch :3</span>
+  </div>
+
+  <div id="exportPanel" class="export-panel" hidden>
+    <div class="export-card">
+      <button id="closeExport" class="secondary">Close</button>
+      <p>Download was blocked by the preview sandbox. Two-finger click / right-click the image below and choose <b>Save Image As…</b></p>
+      <img id="exportImage" alt="exported drawing" />
+    </div>
+  </div>
+
+  <div class="stage">
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const color = document.getElementById("color");
+    const size = document.getElementById("size");
+    const sizeValue = document.getElementById("sizeValue");
+    const pen = document.getElementById("pen");
+    const eraser = document.getElementById("eraser");
+    const undo = document.getElementById("undo");
+    const clear = document.getElementById("clear");
+    const save = document.getElementById("save");
+    const status = document.getElementById("status");
+    const exportPanel = document.getElementById("exportPanel");
+    const exportImage = document.getElementById("exportImage");
+    const closeExport = document.getElementById("closeExport");
+
+    let drawing = false;
+    let erasing = false;
+    let last = null;
+    let history = [];
+
+    function resizeCanvas() {
+      const snapshot = canvas.width && canvas.height ? ctx.getImageData(0, 0, canvas.width, canvas.height) : null;
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+
+      canvas.width = Math.floor(rect.width * dpr);
+      canvas.height = Math.floor(rect.height * dpr);
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+
+      if (snapshot) ctx.putImageData(snapshot, 0, 0);
+    }
+
+    function point(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+      };
+    }
+
+    function saveHistory() {
+      history.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+      if (history.length > 40) history.shift();
+    }
+
+    function draw(from, to) {
+      ctx.globalCompositeOperation = erasing ? "destination-out" : "source-over";
+      ctx.strokeStyle = color.value;
+      ctx.lineWidth = Number(size.value);
+
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      canvas.setPointerCapture(event.pointerId);
+      saveHistory();
+      drawing = true;
+      last = point(event);
+      draw(last, last);
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!drawing) return;
+      const next = point(event);
+      draw(last, next);
+      last = next;
+    });
+
+    function stopDrawing() {
+      drawing = false;
+      last = null;
+    }
+
+    canvas.addEventListener("pointerup", stopDrawing);
+    canvas.addEventListener("pointercancel", stopDrawing);
+    canvas.addEventListener("pointerleave", stopDrawing);
+
+    size.addEventListener("input", () => {
+      sizeValue.textContent = size.value;
+    });
+
+    pen.addEventListener("click", () => {
+      erasing = false;
+      pen.className = "active";
+      eraser.className = "secondary";
+    });
+
+    eraser.addEventListener("click", () => {
+      erasing = true;
+      eraser.className = "active";
+      pen.className = "secondary";
+    });
+
+    undo.addEventListener("click", () => {
+      const previous = history.pop();
+      if (!previous) return;
+
+      ctx.putImageData(previous, 0, 0);
+    });
+
+    clear.addEventListener("click", () => {
+      saveHistory();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    });
+
+    function exportCanvas() {
+      const out = document.createElement("canvas");
+      out.width = canvas.width;
+      out.height = canvas.height;
+
+      const outCtx = out.getContext("2d");
+      outCtx.fillStyle = "white";
+      outCtx.fillRect(0, 0, out.width, out.height);
+      outCtx.drawImage(canvas, 0, 0);
+
+      return out;
+    }
+
+    function showExportPreview(out) {
+      exportImage.src = out.toDataURL("image/png");
+      exportPanel.hidden = false;
+      status.textContent = "Preview opened. Right-click/two-finger click it to save.";
+    }
+
+    function downloadBlob(blob) {
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.download = "drawing.png";
+      link.href = url;
+      link.rel = "noopener";
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+
+    closeExport.addEventListener("click", () => {
+      exportPanel.hidden = true;
+      exportImage.removeAttribute("src");
+    });
+
+    save.addEventListener("click", async () => {
+      const out = exportCanvas();
+      const blob = await new Promise((resolve) => out.toBlob(resolve, "image/png"));
+      if (!blob) return;
+
+      try {
+        if (navigator.clipboard && window.ClipboardItem) {
+          await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+          status.textContent = "PNG copied. Paste it into Preview, Notes, Discord, etc.";
+          return;
+        }
+      } catch (error) {
+        console.warn(error);
+      }
+
+      try {
+        downloadBlob(blob);
+        status.textContent = "Download requested. If Safari blocks it, use the preview.";
+      } catch (error) {
+        console.warn(error);
+      }
+
+      setTimeout(() => showExportPreview(out), 250);
+    });
+
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+  </script>
+</body>
+</html>
