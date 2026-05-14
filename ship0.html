@@ -1,0 +1,999 @@
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta charset="utf-8">
+<title>Stable Unified Particle Ship Sandbox</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#05070b;color:white;font-family:system-ui}
+canvas{display:block;width:100vw;height:100vh;touch-action:none;background:#05070b}
+#ui{position:fixed;left:0;right:0;top:0;display:flex;gap:6px;padding:8px;box-sizing:border-box;z-index:2;flex-wrap:wrap}
+button{font:700 12px system-ui;border:1px solid #fff4;background:#111a;color:white;border-radius:10px;padding:9px 10px}
+button.on{background:#3857ff}
+#hint{position:fixed;left:10px;bottom:10px;font:12px system-ui;color:#ddd;max-width:85vw;z-index:2}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="ui">
+  <button id="armor" class="on">ARMOR</button>
+  <button id="thrust">THRUST</button>
+  <button id="close">CLOSE</button>
+  <button id="undo">UNDO</button>
+  <button id="launch">LAUNCH</button>
+  <button id="edit">EDIT</button>
+  <button id="reset">RESET</button>
+  <button id="demo">DEMO</button>
+  <button id="full">FULL</button>
+</div>
+
+<div id="hint"></div>
+
+<script>
+Object.assign(Float32Array.prototype,{
+  setxy(x,y){this[0]=x;this[1]=y;return this},
+  copy(v){this[0]=v[0];this[1]=v[1];return this},
+  add(v){this[0]+=v[0];this[1]+=v[1];return this},
+  mul(s){this[0]*=s;this[1]*=s;return this},
+  dot(v){return this[0]*v[0]+this[1]*v[1]},
+  clone2(){return V(this[0],this[1])}
+});
+
+const V=(x=0,y=0)=>new Float32Array([x,y]);
+const canvas=document.getElementById("c");
+const ctx=canvas.getContext("2d");
+const hint=document.getElementById("hint");
+
+let W=0,H=0,DPR=1;
+function resize(){
+  DPR=Math.min(3,devicePixelRatio||1);
+  W=innerWidth; H=innerHeight;
+  canvas.width=W*DPR; canvas.height=H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+addEventListener("resize",resize); resize();
+
+const UI={};
+for(const id of ["armor","thrust","close","undo","launch","edit","reset","demo","full"])
+  UI[id]=document.getElementById(id);
+
+let mode="build", material="armor";
+let buildPolys=[], current=[];
+let particles=[], springs=[], bodies=[], enemies=[], player=null;
+let cam=V(0,0), pointer=null;
+let score=0,wave=0,spawnTimer=0,gameOver=false;
+let PID=0;
+
+const hypot=Math.hypot;
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+
+const PHYS={
+  spacing:18,
+  drag:0.991,
+  debrisDrag:0.985,
+  solverIterations:7,
+
+  thrust:105,
+  enemyThrust:22,
+
+  restitution:0.65,
+  collisionPush:0.48,
+  impactBreak:9.5,
+  stretchBreak:1.58,
+  shockDecay:0.9,
+
+  fixedStep:1/60,
+  maxSubSteps:4
+};
+
+function screenToWorld(p){
+  return mode==="build"
+    ? V(p.x-W/2,p.y-H/2)
+    : V(p.x+cam[0]-W/2,p.y+cam[1]-H/2);
+}
+
+function insidePoly(p,poly){
+  let c=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const a=poly[i],b=poly[j];
+    if(((a[1]>p[1])!==(b[1]>p[1])) &&
+      p[0]<(b[0]-a[0])*(p[1]-a[1])/(b[1]-a[1])+a[0]) c=!c;
+  }
+  return c;
+}
+
+function polyArea(poly){
+  let area=0;
+  for(let i=0;i<poly.length;i++){
+    const a=poly[i],b=poly[(i+1)%poly.length];
+    area+=a[0]*b[1]-b[0]*a[1];
+  }
+  return area;
+}
+
+function pointMaterial(p,polys){
+  let m=null;
+  for(const part of polys) if(insidePoly(p,part.points)) m=part.material;
+  return m;
+}
+
+class Particle{
+  constructor(x,y,owner,material="armor"){
+    this.id=PID++;
+    this.p=V(x,y);
+    this.old=V(x,y);
+    this.force=V(0,0);
+    this.r=4.4;
+    this.owner=owner;
+    this.material=material;
+    this.dead=false;
+    this.inactive=false;
+    this.shock=0;
+  }
+  vx(){return this.p[0]-this.old[0]}
+  vy(){return this.p[1]-this.old[1]}
+  addImpulse(ix,iy){
+    this.old[0]-=ix;
+    this.old[1]-=iy;
+  }
+}
+
+class Spring{
+  constructor(a,b,owner,k=0.75){
+    this.a=a; this.b=b; this.owner=owner;
+    this.rest=hypot(a.p[0]-b.p[0],a.p[1]-b.p[1]);
+    this.k=k;
+    this.dead=false;
+  }
+  solve(){
+    if(this.dead||this.a.dead||this.b.dead) return;
+    if(this.a.inactive||this.b.inactive){this.dead=true;return}
+
+    const dx=this.b.p[0]-this.a.p[0];
+    const dy=this.b.p[1]-this.a.p[1];
+    const d=hypot(dx,dy)||0.0001;
+    const stretch=d/this.rest;
+    const shock=Math.max(this.a.shock,this.b.shock);
+
+    if(stretch>PHYS.stretchBreak||shock>PHYS.impactBreak){
+      this.dead=true;
+      if(this.owner) this.owner.damage++;
+      return;
+    }
+
+    const pull=(d-this.rest)/d*this.k*0.5;
+    const ox=dx*pull, oy=dy*pull;
+
+    this.a.p[0]+=ox; this.a.p[1]+=oy;
+    this.b.p[0]-=ox; this.b.p[1]-=oy;
+  }
+}
+
+class Body{
+  constructor(kind){
+    this.kind=kind;
+    this.parts=[];
+    this.springs=[];
+    this.thrustEdges=[];
+    this.damage=0;
+    this.dead=false;
+    this.mainSet=null;
+    this.mainCenter=V(0,0);
+  }
+
+  activeParts(){
+    return this.parts.filter(p=>!p.dead&&!p.inactive);
+  }
+
+  centerOf(list=this.activeParts()){
+    const c=V(0,0);
+    let n=0;
+    for(const p of list){c.add(p.p);n++}
+    if(n)c.mul(1/n);
+    return c;
+  }
+
+  center(){
+    return this.mainSet ? this.centerOf([...this.mainSet]) : this.centerOf();
+  }
+
+  alive(){
+    return this.activeParts().length;
+  }
+
+  computeComponents(){
+    const active=this.activeParts();
+    const activeSet=new Set(active);
+    const adj=new Map();
+
+    for(const p of active) adj.set(p,[]);
+
+    for(const s of this.springs){
+      if(s.dead) continue;
+      if(!activeSet.has(s.a)||!activeSet.has(s.b)) continue;
+      adj.get(s.a).push(s.b);
+      adj.get(s.b).push(s.a);
+    }
+
+    const comps=[];
+    const seen=new Set();
+
+    for(const root of active){
+      if(seen.has(root)) continue;
+
+      const comp=[];
+      const stack=[root];
+      seen.add(root);
+
+      while(stack.length){
+        const p=stack.pop();
+        comp.push(p);
+
+        for(const q of adj.get(p)||[]){
+          if(seen.has(q)) continue;
+          seen.add(q);
+          stack.push(q);
+        }
+      }
+
+      comps.push(comp);
+    }
+
+    comps.sort((a,b)=>b.length-a.length);
+    return comps;
+  }
+
+  pruneDetachedComponents(){
+    if(this.kind!=="player"||this.dead) return;
+
+    const comps=this.computeComponents();
+    if(!comps.length) return;
+
+    const mainArr=comps[0];
+    const main=new Set(mainArr);
+    this.mainSet=main;
+    this.mainCenter=this.centerOf(mainArr);
+
+    if(comps.length<=1) return;
+
+    for(let i=1;i<comps.length;i++){
+      for(const p of comps[i]){
+        p.inactive=true;
+        p.force.setxy(0,0);
+      }
+    }
+
+    for(const s of this.springs){
+      if(s.dead) continue;
+      if(!main.has(s.a)||!main.has(s.b)) s.dead=true;
+    }
+
+    this.thrustEdges=this.thrustEdges.filter(e=>{
+      if(e.pa.dead||e.pb.dead) return false;
+      if(e.pa.inactive||e.pb.inactive) return false;
+      if(!main.has(e.pa)||!main.has(e.pb)) return false;
+      e.particles=e.particles.filter(p=>!p.dead&&!p.inactive&&main.has(p));
+      return e.particles.length>0;
+    });
+
+    this.springs=this.springs.filter(s=>!s.dead);
+  }
+}
+
+function addSpring(a,b,body,k){
+  const s=new Spring(a,b,body,k);
+  springs.push(s);
+  body.springs.push(s);
+  return s;
+}
+
+function makeUnifiedShip(polys,ox=0,oy=0,kind="player"){
+  const body=new Body(kind);
+  const spacing=PHYS.spacing;
+  const grid=new Map();
+
+  if(!polys.length){
+    bodies.push(body);
+    return body;
+  }
+
+  const worldPolys=polys.map(part=>({
+    material:part.material,
+    points:part.points.map(p=>V(p[0]+ox,p[1]+oy))
+  }));
+
+  const all=worldPolys.flatMap(p=>p.points);
+  const xs=all.map(p=>p[0]), ys=all.map(p=>p[1]);
+  const minx=Math.min(...xs),maxx=Math.max(...xs);
+  const miny=Math.min(...ys),maxy=Math.max(...ys);
+  const key=(ix,iy)=>ix+","+iy;
+
+  function addParticle(ix,iy,mat){
+    const k=key(ix,iy);
+    if(grid.has(k)) return grid.get(k);
+
+    const p=new Particle(ix*spacing,iy*spacing,body,mat);
+    grid.set(k,p);
+    particles.push(p);
+    body.parts.push(p);
+    return p;
+  }
+
+  for(let iy=Math.floor(miny/spacing)-2;iy<=Math.ceil(maxy/spacing)+2;iy++){
+    for(let ix=Math.floor(minx/spacing)-2;ix<=Math.ceil(maxx/spacing)+2;ix++){
+      const p=V(ix*spacing,iy*spacing);
+      const mat=pointMaterial(p,worldPolys);
+      if(mat) addParticle(ix,iy,mat);
+    }
+  }
+
+  const dirs=[[1,0],[0,1],[1,1],[1,-1],[2,0],[0,2]];
+
+  for(const [k,p] of grid){
+    const [ix,iy]=k.split(",").map(Number);
+
+    for(const [dx,dy] of dirs){
+      const q=grid.get(key(ix+dx,iy+dy));
+      if(!q) continue;
+
+      const hard=
+        p.material==="armor"&&q.material==="armor" ? 0.92 :
+        p.material==="thrust"&&q.material==="thrust" ? 0.62 :
+        0.76;
+
+      addSpring(p,q,body,hard);
+    }
+  }
+
+  for(const part of worldPolys){
+    if(part.material!=="thrust") continue;
+
+    const area=polyArea(part.points);
+
+    for(let i=0;i<part.points.length;i++){
+      const a=part.points[i];
+      const b=part.points[(i+1)%part.points.length];
+      const dx=b[0]-a[0];
+      const dy=b[1]-a[1];
+      const l=hypot(dx,dy)||1;
+
+      const nx=area>0 ? dy/l : -dy/l;
+      const ny=area>0 ? -dx/l : dx/l;
+
+      const near=[];
+
+      for(const p of body.parts){
+        const apx=p.p[0]-a[0], apy=p.p[1]-a[1];
+        const t=clamp((apx*dx+apy*dy)/(l*l),0,1);
+        const sx=a[0]+dx*t, sy=a[1]+dy*t;
+        const d=hypot(p.p[0]-sx,p.p[1]-sy);
+
+        if(d<spacing*0.9) near.push(p);
+      }
+
+      if(near.length){
+        let pa=near[0],pb=near[0],da=Infinity,db=Infinity;
+
+        for(const p of near){
+          const aa=hypot(p.p[0]-a[0],p.p[1]-a[1]);
+          const bb=hypot(p.p[0]-b[0],p.p[1]-b[1]);
+
+          if(aa<da){da=aa;pa=p}
+          if(bb<db){db=bb;pb=p}
+        }
+
+        body.thrustEdges.push({
+          particles:near,
+          pa,
+          pb,
+          dir:V(nx,ny),
+          active:0
+        });
+      }
+    }
+  }
+
+  bodies.push(body);
+  body.pruneDetachedComponents();
+  return body;
+}
+
+function makeEnemy(x,y,level){
+  const r=24+level*1.4;
+  const poly=[];
+
+  for(let i=0;i<5;i++){
+    const a=i/5*Math.PI*2;
+    poly.push(V(Math.cos(a)*r,Math.sin(a)*r));
+  }
+
+  const e=makeUnifiedShip([{material:"armor",points:poly}],x,y,"enemy");
+  enemies.push(e);
+  return e;
+}
+
+function defaultShip(){
+  buildPolys=[
+    {
+      material:"armor",
+      points:[V(-46,28),V(0,-54),V(46,28),V(18,18),V(0,30),V(-18,18)]
+    },
+    {
+      material:"thrust",
+      points:[V(-34,26),V(-8,26),V(-8,66),V(-34,66)]
+    },
+    {
+      material:"thrust",
+      points:[V(8,26),V(34,26),V(34,66),V(8,66)]
+    }
+  ];
+}
+
+function closePoly(){
+  if(current.length<3) return;
+  buildPolys.push({material,points:current.map(p=>p.clone2())});
+  current=[];
+}
+
+function launch(){
+  if(current.length>=3) closePoly();
+  if(!buildPolys.length) defaultShip();
+
+  particles=[]; springs=[]; bodies=[]; enemies=[];
+  player=makeUnifiedShip(buildPolys,0,0,"player");
+
+  mode="play";
+  score=0; wave=0; spawnTimer=0; gameOver=false;
+  cam.copy(player.center());
+}
+
+function edit(){
+  mode="build";
+  current=[];
+  particles=[]; springs=[]; bodies=[]; enemies=[];
+  player=null; gameOver=false;
+}
+
+function reset(){
+  mode="build";
+  current=[]; buildPolys=[];
+  particles=[]; springs=[]; bodies=[]; enemies=[];
+  player=null; gameOver=false; score=0; wave=0;
+}
+
+UI.armor.onclick=()=>{
+  material="armor";
+  UI.armor.classList.add("on");
+  UI.thrust.classList.remove("on");
+};
+
+UI.thrust.onclick=()=>{
+  material="thrust";
+  UI.thrust.classList.add("on");
+  UI.armor.classList.remove("on");
+};
+
+UI.close.onclick=closePoly;
+
+UI.undo.onclick=()=>{
+  if(mode!=="build") return;
+  if(current.length) current.pop();
+  else buildPolys.pop();
+};
+
+UI.launch.onclick=launch;
+UI.edit.onclick=edit;
+UI.reset.onclick=reset;
+
+UI.demo.onclick=()=>{
+  mode="build";
+  current=[];
+  defaultShip();
+};
+
+UI.full.onclick=async()=>{
+  const el=document.documentElement;
+
+  try{
+    if(document.fullscreenElement||document.webkitFullscreenElement){
+      if(document.exitFullscreen) await document.exitFullscreen();
+      else if(document.webkitExitFullscreen) await document.webkitExitFullscreen();
+    }else{
+      if(el.requestFullscreen) await el.requestFullscreen();
+      else if(el.webkitRequestFullscreen) await el.webkitRequestFullscreen();
+      else hint.textContent="Fullscreen is not available in this Safari context.";
+    }
+  }catch(e){
+    hint.textContent="Fullscreen was blocked by Safari. Try Add to Home Screen or open directly in Safari.";
+  }
+
+  setTimeout(resize,300);
+};
+
+function getPointer(e){
+  const r=canvas.getBoundingClientRect();
+  return {id:e.pointerId,x:e.clientX-r.left,y:e.clientY-r.top};
+}
+
+canvas.addEventListener("pointerdown",e=>{
+  canvas.setPointerCapture(e.pointerId);
+  const p=getPointer(e);
+
+  if(mode==="build") current.push(screenToWorld(p));
+  else pointer=p;
+});
+
+canvas.addEventListener("pointermove",e=>{
+  if(pointer&&pointer.id===e.pointerId) pointer=getPointer(e);
+});
+
+canvas.addEventListener("pointerup",e=>{
+  if(pointer&&pointer.id===e.pointerId) pointer=null;
+});
+
+canvas.addEventListener("pointercancel",e=>{
+  if(pointer&&pointer.id===e.pointerId) pointer=null;
+});
+
+function integrate(dt){
+  for(const p of particles){
+    if(p.dead) continue;
+
+    p.shock*=PHYS.shockDecay;
+
+    const drag=p.inactive ? PHYS.debrisDrag : PHYS.drag;
+    const vx=(p.p[0]-p.old[0])*drag+p.force[0]*dt;
+    const vy=(p.p[1]-p.old[1])*drag+p.force[1]*dt;
+
+    p.old.copy(p.p);
+    p.p[0]+=vx;
+    p.p[1]+=vy;
+    p.force.setxy(0,0);
+  }
+}
+
+function collideParticles(){
+  const cell=28;
+  const grid=new Map();
+  const key=(x,y)=>Math.floor(x/cell)+","+Math.floor(y/cell);
+
+  for(const p of particles){
+    if(p.dead||p.inactive) continue;
+    const k=key(p.p[0],p.p[1]);
+    if(!grid.has(k)) grid.set(k,[]);
+    grid.get(k).push(p);
+  }
+
+  for(const p of particles){
+    if(p.dead||p.inactive) continue;
+
+    const gx=Math.floor(p.p[0]/cell);
+    const gy=Math.floor(p.p[1]/cell);
+
+    for(let yy=-1;yy<=1;yy++){
+      for(let xx=-1;xx<=1;xx++){
+        const arr=grid.get((gx+xx)+","+(gy+yy));
+        if(!arr) continue;
+
+        for(const q of arr){
+          if(q.id<=p.id) continue;
+          if(q.dead||q.inactive) continue;
+          if(p.owner===q.owner) continue;
+
+          const dx=q.p[0]-p.p[0];
+          const dy=q.p[1]-p.p[1];
+          const d=hypot(dx,dy)||0.0001;
+          const min=p.r+q.r;
+
+          if(d>=min) continue;
+
+          const nx=dx/d, ny=dy/d;
+          const overlap=min-d;
+          const push=overlap*PHYS.collisionPush;
+
+          p.p[0]-=nx*push;
+          p.p[1]-=ny*push;
+          q.p[0]+=nx*push;
+          q.p[1]+=ny*push;
+
+          const rvx=q.vx()-p.vx();
+          const rvy=q.vy()-p.vy();
+          const closing=rvx*nx+rvy*ny;
+
+          if(closing<0){
+            const j=-(1+PHYS.restitution)*closing*0.5;
+
+            p.addImpulse(-nx*j,-ny*j);
+            q.addImpulse( nx*j, ny*j);
+
+            const shock=Math.abs(j);
+            p.shock+=shock;
+            q.shock+=shock;
+          }
+        }
+      }
+    }
+  }
+}
+
+function applyControls(){
+  if(!player||gameOver) return;
+
+  for(const e of player.thrustEdges) e.active*=0.82;
+
+  let dir=null;
+
+  if(pointer){
+    const cx=W/2,cy=H*0.72;
+    const dx=pointer.x-cx,dy=pointer.y-cy;
+    const l=hypot(dx,dy);
+
+    if(l>10) dir=V(dx/l,dy/l).mul(clamp(l/130,0,1));
+  }
+
+  if(!dir) return;
+
+  for(const e of player.thrustEdges){
+    if(e.pa.dead||e.pb.dead||e.pa.inactive||e.pb.inactive) continue;
+
+    const dot=e.dir.dot(dir);
+    if(dot<=0) continue;
+
+    e.active=Math.max(e.active,dot);
+
+    const live=e.particles.filter(p=>!p.dead&&!p.inactive);
+    const force=PHYS.thrust*dot/Math.max(1,live.length);
+
+    for(const p of live){
+      p.force[0]+=e.dir[0]*force;
+      p.force[1]+=e.dir[1]*force;
+    }
+  }
+}
+
+function enemyAI(){
+  if(!player||gameOver) return;
+
+  const pc=player.center();
+
+  for(const e of enemies){
+    if(e.dead) continue;
+
+    const c=e.center();
+    const dx=pc[0]-c[0], dy=pc[1]-c[1];
+    const l=hypot(dx,dy)||1;
+    const fx=dx/l*PHYS.enemyThrust;
+    const fy=dy/l*PHYS.enemyThrust;
+
+    for(const p of e.activeParts()){
+      p.force[0]+=fx;
+      p.force[1]+=fy;
+    }
+  }
+}
+
+function cleanup(){
+  springs=springs.filter(s=>!s.dead&&!s.a.dead&&!s.b.dead&&!s.a.inactive&&!s.b.inactive);
+
+  for(const b of bodies){
+    if(b.dead) continue;
+
+    b.springs=b.springs.filter(s=>!s.dead);
+
+    if(b.kind==="player") b.pruneDetachedComponents();
+
+    b.springs=b.springs.filter(s=>!s.dead);
+
+    if(b.alive()<3) b.dead=true;
+
+    const activeSpringCount=Math.max(1,b.springs.length);
+    if(b.damage>activeSpringCount*0.55) b.dead=true;
+  }
+
+  springs=springs.filter(s=>!s.dead&&!s.a.dead&&!s.b.dead&&!s.a.inactive&&!s.b.inactive);
+
+  enemies=enemies.filter(e=>{
+    if(e.dead){
+      score+=10;
+      return false;
+    }
+    return true;
+  });
+
+  if(player&&player.dead) gameOver=true;
+}
+
+function spawn(dt){
+  if(gameOver||!player) return;
+
+  spawnTimer-=dt;
+  if(spawnTimer>0) return;
+
+  wave++;
+  const pc=player.center();
+
+  for(let i=0;i<Math.min(2+wave,8);i++){
+    const a=Math.random()*Math.PI*2;
+    const d=500+rnd(0,260);
+    makeEnemy(pc[0]+Math.cos(a)*d,pc[1]+Math.sin(a)*d,wave);
+  }
+
+  spawnTimer=Math.max(4.5,9-wave*0.18);
+}
+
+function physicsStep(dt){
+  if(mode!=="play") return;
+
+  applyControls();
+  enemyAI();
+  integrate(dt);
+
+  for(let i=0;i<PHYS.solverIterations;i++){
+    for(const s of springs) s.solve();
+    collideParticles();
+  }
+
+  cleanup();
+  spawn(dt);
+
+  if(player&&!player.dead){
+    cam.copy(player.center());
+  }
+}
+
+function drawParticle(p){
+  ctx.beginPath();
+  ctx.arc(p.p[0],p.p[1],p.r,0,Math.PI*2);
+  ctx.fill();
+}
+
+function drawBody(b){
+  ctx.lineWidth=2;
+
+  for(const s of b.springs){
+    if(s.dead) continue;
+
+    const d=hypot(s.a.p[0]-s.b.p[0],s.a.p[1]-s.b.p[1]);
+    const stretch=d/s.rest;
+
+    ctx.strokeStyle=
+      stretch>1.28 ? "#ff385e" :
+      b.kind==="player" ? "#dfe9ff" :
+      "#ff8890";
+
+    ctx.beginPath();
+    ctx.moveTo(s.a.p[0],s.a.p[1]);
+    ctx.lineTo(s.b.p[0],s.b.p[1]);
+    ctx.stroke();
+  }
+
+  for(const p of b.parts){
+    if(p.dead) continue;
+
+    ctx.fillStyle=
+      p.inactive ? "rgba(145,155,170,0.35)" :
+      p.material==="thrust"&&b.kind==="player" ? "#67f6ff" :
+      b.kind==="player" ? "#fff" :
+      "#ff6470";
+
+    drawParticle(p);
+  }
+
+  if(b.kind==="player"){
+    for(const e of b.thrustEdges){
+      if(e.pa.dead||e.pb.dead||e.pa.inactive||e.pb.inactive) continue;
+
+      const a=e.pa.p;
+      const bb=e.pb.p;
+      const active=clamp(e.active||0,0,1);
+
+      ctx.lineWidth=3+active*5;
+      ctx.strokeStyle=active>0.04
+        ? `rgba(150,245,255,${0.45+active*0.55})`
+        : "rgba(80,220,255,0.55)";
+
+      ctx.beginPath();
+      ctx.moveTo(a[0],a[1]);
+      ctx.lineTo(bb[0],bb[1]);
+      ctx.stroke();
+
+      const mx=(a[0]+bb[0])/2;
+      const my=(a[1]+bb[1])/2;
+
+      ctx.lineWidth=2+active*4;
+      ctx.strokeStyle=active>0.04
+        ? `rgba(255,255,190,${0.35+active*0.65})`
+        : "rgba(100,230,255,0.45)";
+
+      ctx.beginPath();
+      ctx.moveTo(mx,my);
+      ctx.lineTo(mx+e.dir[0]*(20+active*20),my+e.dir[1]*(20+active*20));
+      ctx.stroke();
+
+      if(active>0.05){
+        ctx.fillStyle=`rgba(140,245,255,${0.08+active*0.18})`;
+        ctx.beginPath();
+        ctx.arc(mx+e.dir[0]*18,my+e.dir[1]*18,10+active*18,0,Math.PI*2);
+        ctx.fill();
+      }
+    }
+  }
+}
+
+function drawBuild(){
+  ctx.save();
+  ctx.translate(W/2,H/2);
+
+  ctx.strokeStyle="#1d2a3a";
+  ctx.lineWidth=1;
+
+  for(let x=-W;x<W;x+=PHYS.spacing){
+    ctx.beginPath(); ctx.moveTo(x,-H); ctx.lineTo(x,H); ctx.stroke();
+  }
+
+  for(let y=-H;y<H;y+=PHYS.spacing){
+    ctx.beginPath(); ctx.moveTo(-W,y); ctx.lineTo(W,y); ctx.stroke();
+  }
+
+  for(const part of buildPolys){
+    ctx.fillStyle=part.material==="armor" ? "#ffffff22" : "#58efff33";
+    ctx.strokeStyle=part.material==="armor" ? "#fff" : "#58efff";
+    ctx.lineWidth=3;
+
+    ctx.beginPath();
+    part.points.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    if(part.material==="thrust"){
+      const area=polyArea(part.points);
+
+      for(let i=0;i<part.points.length;i++){
+        const a=part.points[i],b=part.points[(i+1)%part.points.length];
+        const dx=b[0]-a[0],dy=b[1]-a[1];
+        const l=hypot(dx,dy)||1;
+
+        const nx=area>0 ? dy/l : -dy/l;
+        const ny=area>0 ? -dx/l : dx/l;
+
+        const mx=(a[0]+b[0])/2;
+        const my=(a[1]+b[1])/2;
+
+        ctx.beginPath();
+        ctx.moveTo(mx,my);
+        ctx.lineTo(mx+nx*20,my+ny*20);
+        ctx.stroke();
+      }
+    }
+  }
+
+  if(current.length){
+    ctx.strokeStyle=material==="armor" ? "#fff" : "#58efff";
+    ctx.fillStyle=ctx.strokeStyle;
+    ctx.lineWidth=3;
+
+    ctx.beginPath();
+    current.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));
+    ctx.stroke();
+
+    for(const p of current){
+      ctx.beginPath();
+      ctx.arc(p[0],p[1],5,0,Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  ctx.restore();
+
+  hint.textContent="Build: draw polygons. LAUNCH fills the union with particles and a stable shared spring mesh. Current: "+material.toUpperCase();
+}
+
+function drawPlay(){
+  ctx.save();
+  ctx.translate(W/2-cam[0],H/2-cam[1]);
+
+  ctx.strokeStyle="#162033";
+  ctx.lineWidth=1;
+
+  const gx=Math.floor((cam[0]-W/2)/80)*80;
+  const gy=Math.floor((cam[1]-H/2)/80)*80;
+
+  for(let x=gx;x<cam[0]+W/2+80;x+=80){
+    ctx.beginPath();
+    ctx.moveTo(x,cam[1]-H/2-80);
+    ctx.lineTo(x,cam[1]+H/2+80);
+    ctx.stroke();
+  }
+
+  for(let y=gy;y<cam[1]+H/2+80;y+=80){
+    ctx.beginPath();
+    ctx.moveTo(cam[0]-W/2-80,y);
+    ctx.lineTo(cam[0]+W/2+80,y);
+    ctx.stroke();
+  }
+
+  for(const b of bodies) if(!b.dead) drawBody(b);
+
+  ctx.restore();
+
+  if(pointer){
+    ctx.strokeStyle="#ffffff88";
+    ctx.lineWidth=2;
+
+    ctx.beginPath();
+    ctx.arc(W/2,H*0.72,55,0,Math.PI*2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(W/2,H*0.72);
+    ctx.lineTo(pointer.x,pointer.y);
+    ctx.stroke();
+  }
+
+  const activeCount=player?player.activeParts().length:0;
+  const inactiveCount=player?player.parts.filter(p=>p.inactive&&!p.dead).length:0;
+
+  ctx.fillStyle="white";
+  ctx.font="14px system-ui";
+  ctx.fillText(
+    "score "+score+
+    "  wave "+wave+
+    "  active "+activeCount+
+    "  debris "+inactiveCount+
+    "  springs "+springs.length,
+    12,
+    H-18
+  );
+
+  if(gameOver){
+    ctx.fillStyle="#000b";
+    ctx.fillRect(0,0,W,H);
+
+    ctx.fillStyle="white";
+    ctx.textAlign="center";
+    ctx.font="700 28px system-ui";
+    ctx.fillText("SHIP DESTROYED",W/2,H/2-15);
+
+    ctx.font="14px system-ui";
+    ctx.fillText("Press EDIT, RESET, or LAUNCH",W/2,H/2+18);
+    ctx.textAlign="left";
+  }
+
+  hint.textContent="Play: fixed-step physics, single-pass collision pairs, and stable main-component camera reduce jitter/jumping.";
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  mode==="build" ? drawBuild() : drawPlay();
+}
+
+let last=performance.now();
+let acc=0;
+
+function loop(t){
+  let frame=(t-last)/1000;
+  last=t;
+
+  frame=Math.min(frame,PHYS.fixedStep*PHYS.maxSubSteps);
+  acc+=frame;
+
+  let steps=0;
+
+  while(acc>=PHYS.fixedStep&&steps<PHYS.maxSubSteps){
+    physicsStep(PHYS.fixedStep);
+    acc-=PHYS.fixedStep;
+    steps++;
+  }
+
+  draw();
+  requestAnimationFrame(loop);
+}
+
+defaultShip();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
