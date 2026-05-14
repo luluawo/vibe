@@ -75,7 +75,10 @@ const PHYS={
   debrisDrag:0.985,
   solverIterations:7,
 
-  thrust:105,
+  // New: thrust is now proportional to thrust edge length.
+  // Total edge force = thrustPerLength * edge.length * joystick alignment.
+  thrustPerLength:3.0,
+
   enemyThrust:22,
 
   restitution:0.65,
@@ -389,6 +392,7 @@ function makeUnifiedShip(polys,ox=0,oy=0,kind="player"){
           pa,
           pb,
           dir:V(nx,ny),
+          length:l,
           active:0
         });
       }
@@ -644,7 +648,11 @@ function applyControls(){
     e.active=Math.max(e.active,dot);
 
     const live=e.particles.filter(p=>!p.dead&&!p.inactive);
-    const force=PHYS.thrust*dot/Math.max(1,live.length);
+
+    // New behavior:
+    // Longer thrust edges generate proportionally more total force.
+    const totalForce=PHYS.thrustPerLength*e.length*dot;
+    const force=totalForce/Math.max(1,live.length);
 
     for(const p of live){
       p.force[0]+=e.dir[0]*force;
@@ -888,7 +896,7 @@ function drawBuild(){
 
   ctx.restore();
 
-  hint.textContent="Build: draw polygons. LAUNCH fills the union with particles and a stable shared spring mesh. Current: "+material.toUpperCase();
+  hint.textContent="Build: thrust edge power is proportional to edge length. Current: "+material.toUpperCase();
 }
 
 function drawPlay(){
@@ -962,7 +970,7 @@ function drawPlay(){
     ctx.textAlign="left";
   }
 
-  hint.textContent="Play: fixed-step physics, single-pass collision pairs, and stable main-component camera reduce jitter/jumping.";
+  hint.textContent="Play: longer thrust edges produce more total thrust. Active edges glow brighter.";
 }
 
 function draw(){
